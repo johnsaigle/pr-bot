@@ -70,13 +70,36 @@ struct PrCursor {
 
 // ─── GitHub JSON types ────────────────────────────────
 
+fn repo_from_url(url: &str) -> String {
+    let after = url.strip_prefix("https://github.com/").unwrap_or(url);
+    let parts: Vec<&str> = after.splitn(3, '/').collect();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        after.to_string()
+    }
+}
+
+fn deserialize_repo_from_head<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct RepoObj {
+        #[serde(rename = "nameWithOwner")]
+        name_with_owner: String,
+    }
+    Ok(RepoObj::deserialize(deserializer)?.name_with_owner)
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct GhIssue {
     number: u64,
     title: String,
     body: String,
-    #[serde(rename = "nameWithOwner")]
+    url: String,
+    #[serde(skip)]
     repo: String,
     #[serde(rename = "createdAt")]
     created_at: String,
@@ -89,7 +112,7 @@ struct GhPr {
     title: String,
     #[serde(rename = "headRefOid")]
     head_ref_oid: String,
-    #[serde(rename = "nameWithOwner")]
+    #[serde(rename = "headRepository", deserialize_with = "deserialize_repo_from_head")]
     repo: String,
 }
 
@@ -161,12 +184,16 @@ async fn fetch_assigned_issues(config: &Config) -> Result<Vec<GhIssue>> {
         "--assignee".into(), assignee,
         "--state".into(), "open".into(),
         "--search".into(), "is:issue".into(),
-        "--json".into(), "number,title,body,nameWithOwner,createdAt,author".into(),
+        "--json".into(), "number,title,body,url,createdAt,author".into(),
         "--limit".into(), "30".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
-    serde_json::from_str(&stdout).context("Failed to parse gh issue list")
+    let mut issues: Vec<GhIssue> = serde_json::from_str(&stdout).context("Failed to parse gh issue list")?;
+    for issue in &mut issues {
+        issue.repo = repo_from_url(&issue.url);
+    }
+    Ok(issues)
 }
 
 async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
@@ -175,7 +202,7 @@ async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
         "pr".into(), "list".into(),
         "--author".into(), author,
         "--state".into(), "open".into(),
-        "--json".into(), "number,title,headRefOid,nameWithOwner".into(),
+        "--json".into(), "number,title,headRefOid,headRepository".into(),
         "--limit".into(), "30".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
