@@ -1,0 +1,15 @@
+# ~/.config/pr-bot/config.toml
+
+bot_username = "my-coder-bot"
+authorized_user = "your-real-username"
+repos = ["myorg/backend"]
+
+# Paths (defaults shown)
+# workflows_dir = "~/.config/pr-bot/workflows"
+# cache_dir = "~/.cache/pr-bot"
+# state_file = "~/.config/pr-bot/state.json"
+
+# max_concurrent = 3
+# poll_interval_secs = 300
+# task_timeout_secs = 1800
+# model = "anthropic/claude-sonnet-4"

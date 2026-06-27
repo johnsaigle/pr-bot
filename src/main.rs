@@ -1,0 +1,465 @@
+use anyhow::{bail, Context, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::sync::Semaphore;
+use tracing::{debug, error, info, warn};
+
+// ─── Config ───────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+struct Config {
+    bot_username: String,
+    authorized_user: String,
+    repos: Vec<String>,
+    #[serde(default = "default_workflows_dir")]
+    workflows_dir: PathBuf,
+    #[serde(default = "default_cache_dir")]
+    cache_dir: PathBuf,
+    #[serde(default = "default_state_file")]
+    state_file: PathBuf,
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent: usize,
+    #[serde(default = "default_opencode")]
+    opencode_bin: PathBuf,
+    #[serde(default = "default_gh")]
+    gh_bin: String,
+    #[serde(default = "default_poll_interval")]
+    poll_interval_secs: u64,
+    model: Option<String>,
+    #[serde(default = "default_task_timeout")]
+    task_timeout_secs: u64,
+}
+
+fn default_workflows_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pr-bot/workflows")
+}
+fn default_cache_dir() -> PathBuf {
+    dirs::cache_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pr-bot")
+}
+fn default_state_file() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("/tmp")).join("pr-bot/state.json")
+}
+const fn default_max_concurrent() -> usize { 3 }
+fn default_opencode() -> PathBuf { PathBuf::from("opencode") }
+fn default_gh() -> String { "gh".into() }
+const fn default_poll_interval() -> u64 { 300 }
+const fn default_task_timeout() -> u64 { 1800 }
+
+// ─── State ────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct State {
+    processed_issues: HashMap<String, String>,
+    pr_cursors: HashMap<String, PrCursor>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PrCursor {
+    last_head_sha: String,
+    last_comment_id: u64,
+    last_review_id: u64,
+    last_updated: String,
+}
+
+// ─── GitHub JSON types ────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GhIssue {
+    number: u64,
+    title: String,
+    body: String,
+    #[serde(rename = "nameWithOwner")]
+    repo: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+    author: Option<GhAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPr {
+    number: u64,
+    title: String,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(rename = "nameWithOwner")]
+    repo: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+struct GhComment {
+    id: u64,
+    body: String,
+    author: Option<GhAuthor>,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GhReview {
+    id: u64,
+    body: String,
+    state: String,
+    user: Option<GhAuthor>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GhAuthor {
+    login: String,
+}
+
+// ─── Helpers ──────────────────────────────────────────
+
+async fn run_cmd<S: AsRef<std::ffi::OsStr>>(cmd: &str, args: &[S]) -> Result<String> {
+    let args_display: Vec<&str> = args.iter().filter_map(|a| a.as_ref().to_str()).collect();
+    let output = Command::new(cmd)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context(format!("Failed to spawn '{cmd} {}'", args_display.join(" ")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        if stderr.contains("rate limit") || stderr.contains("429") {
+            bail!("GitHub rate limited: {stderr}");
+        }
+        bail!("'{cmd} {}' failed (exit {:?}): {stderr}", args_display.join(" "), output.status.code());
+    }
+    if !stderr.is_empty() {
+        debug!("stderr '{cmd} {}': {stderr}", args_display.join(" "));
+    }
+    Ok(stdout)
+}
+
+// ─── Author gate ──────────────────────────────────────
+
+fn is_authorized(author: &Option<GhAuthor>, config: &Config) -> bool {
+    author
+        .as_ref()
+        .map(|a| a.login == config.authorized_user)
+        .unwrap_or(false)
+}
+
+// ─── GitHub polling ───────────────────────────────────
+
+async fn fetch_assigned_issues(config: &Config) -> Result<Vec<GhIssue>> {
+    let assignee = format!("@{}", config.bot_username);
+    let mut args: Vec<String> = vec![
+        "issue".into(), "list".into(),
+        "--assignee".into(), assignee,
+        "--state".into(), "open".into(),
+        "--search".into(), "is:issue".into(),
+        "--json".into(), "number,title,body,nameWithOwner,createdAt,author".into(),
+        "--limit".into(), "30".into(),
+    ];
+    if config.repos.len() == 1 {
+        args.push("--repo".into());
+        args.push(config.repos[0].clone());
+    }
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse gh issue list")
+}
+
+async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
+    let author = format!("@{}", config.bot_username);
+    let mut args: Vec<String> = vec![
+        "pr".into(), "list".into(),
+        "--author".into(), author,
+        "--state".into(), "open".into(),
+        "--json".into(), "number,title,headRefOid,nameWithOwner".into(),
+        "--limit".into(), "30".into(),
+    ];
+    if config.repos.len() == 1 {
+        args.push("--repo".into());
+        args.push(config.repos[0].clone());
+    }
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse gh pr list")
+}
+
+async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
+    let endpoint = format!("/repos/{repo}/issues/{pr_number}/comments");
+    let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse issue comments")
+}
+
+async fn fetch_pr_review_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
+    let endpoint = format!("/repos/{repo}/pulls/{pr_number}/comments");
+    let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse review comments")
+}
+
+async fn fetch_pr_reviews(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhReview>> {
+    let endpoint = format!("/repos/{repo}/pulls/{pr_number}/reviews");
+    let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse reviews")
+}
+
+// ─── Task directory ───────────────────────────────────
+
+async fn ensure_task_dir(config: &Config, label: &str) -> Result<PathBuf> {
+    let dir = config.cache_dir.join("tasks").join(label.replace('/', "-"));
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(dir)
+}
+
+// ─── Launch opencode ──────────────────────────────────
+
+async fn launch_opencode(
+    config: &Config,
+    task_dir: &Path,
+    context_json: &str,
+    workflow_name: &str,
+    label: &str,
+) -> Result<()> {
+    let prompt = format!(
+        "WORKFLOW: {workflow_name}\n\
+         WORKFLOWS_DIR: {workflows_dir}\n\n\
+         Read the workflow file in the workflows directory for instructions.\n\
+         Here is the task context as JSON:\n\n{context_json}",
+        workflow_name = workflow_name,
+        workflows_dir = config.workflows_dir.display(),
+        context_json = context_json,
+    );
+
+    info!("[{label}] launching opencode in {task_dir:?}");
+    let mut cmd = Command::new(&config.opencode_bin);
+    cmd.args(["run", "--dangerously-skip-permissions"])
+        .arg("--dir").arg(task_dir)
+        .arg(&prompt)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(ref model) = config.model {
+        cmd.arg("--model").arg(model);
+    }
+
+    let child = cmd.spawn().context("Failed to spawn opencode")?;
+    let pid = child.id().unwrap_or(0);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(config.task_timeout_secs),
+        async { child.wait_with_output().await.map(|o| o.status.success()) },
+    ).await;
+
+    match result {
+        Ok(Ok(true)) => info!("[{label}] done"),
+        Ok(Ok(false)) => warn!("[{label}] opencode exited non-zero"),
+        Ok(Err(e)) => warn!("[{label}] opencode error: {e:#}"),
+        Err(_) => {
+            warn!("[{label}] timed out, killing pid {pid}");
+            let _ = Command::new("kill").arg(pid.to_string()).output().await;
+        }
+    }
+    Ok(())
+}
+
+// ─── State helpers ────────────────────────────────────
+
+fn load_state(path: &Path) -> State {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(path: &Path, state: &State) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(state)?)?;
+    Ok(())
+}
+
+// ─── Main loop ────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "pr_bot=info".into()),
+        )
+        .init();
+
+    let config_path = std::env::var("PR_BOT_CONFIG").unwrap_or_else(|_| {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("pr-bot/config.toml")
+            .to_string_lossy()
+            .to_string()
+    });
+
+    let config: Config = {
+        let data = std::fs::read_to_string(&config_path)
+            .context(format!("Config not found at {config_path}"))?;
+        toml::from_str(&data).context("Failed to parse config")?
+    };
+
+    info!("pr-bot starting. bot=@{} authorized=@{} repos={:?}",
+        config.bot_username, config.authorized_user, config.repos);
+
+    let mut state = load_state(&config.state_file);
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
+
+    loop {
+        info!("── poll ──");
+
+        // ── 1. Assigned issues (author-gated) ──
+        match fetch_assigned_issues(&config).await {
+            Ok(issues) => {
+                let new: Vec<_> = issues.into_iter().filter(|i| {
+                    let key = format!("{}/issues#{}", i.repo, i.number);
+                    let repo_match = config.repos.is_empty() || config.repos.contains(&i.repo);
+                    repo_match
+                        && is_authorized(&i.author, &config)
+                        && !state.processed_issues.contains_key(&key)
+                }).collect();
+
+                if !new.is_empty() {
+                    info!("{} new authorized issue(s)", new.len());
+                }
+
+                for issue in new {
+                    let key = format!("{}/issues#{}", issue.repo, issue.number);
+                    state.processed_issues.insert(key.clone(), Utc::now().to_rfc3339());
+                    info!("  issue {repo}#{num}", repo = issue.repo, num = issue.number);
+
+                    let ctx = serde_json::json!({
+                        "repo": issue.repo,
+                        "issue_number": issue.number,
+                        "title": issue.title,
+                        "body": issue.body,
+                        "author": issue.author.map(|a| a.login),
+                    });
+
+                    let config = config.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let label = format!("{}-issue-{}", ctx["repo"].as_str().unwrap(), ctx["issue_number"]);
+                        let dir = match ensure_task_dir(&config, &label).await {
+                            Ok(d) => d,
+                            Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                        };
+                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "new-issue", &label).await;
+                    });
+                }
+
+                save_state(&config.state_file, &state).ok();
+            }
+            Err(e) => warn!("issue fetch failed: {e:#}"),
+        }
+
+        // ── 2. PR feedback (author-gated) ──
+        match fetch_open_prs(&config).await {
+            Ok(prs) => {
+                let mut dirty = false;
+
+                for pr in prs {
+                    let pr_key = format!("{}/prs#{}", pr.repo, pr.number);
+                    let cursor = state.pr_cursors.get(&pr_key);
+                    if cursor.map(|c| c.last_head_sha == pr.head_ref_oid).unwrap_or(false) {
+                        continue;
+                    }
+
+                    let ic = fetch_pr_issue_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
+                    let rc = fetch_pr_review_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
+                    let rv = fetch_pr_reviews(&config, &pr.repo, pr.number).await.unwrap_or_default();
+
+                    let max_cid = cursor.map(|c| c.last_comment_id).unwrap_or(0);
+                    let max_rid = cursor.map(|c| c.last_review_id).unwrap_or(0);
+
+                    let new_ic: Vec<_> = ic.iter()
+                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .cloned().collect();
+                    let new_rc: Vec<_> = rc.iter()
+                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .cloned().collect();
+                    let new_rv: Vec<_> = rv.iter()
+                        .filter(|r| r.id > max_rid && is_authorized(&r.user, &config))
+                        .cloned().collect();
+
+                    if new_ic.is_empty() && new_rc.is_empty() && new_rv.is_empty() {
+                        continue;
+                    }
+
+                    let new_max_comment = new_ic.iter().chain(new_rc.iter())
+                        .map(|c| c.id).max().unwrap_or(max_cid).max(max_cid);
+                    let new_max_review = new_rv.iter()
+                        .map(|r| r.id).max().unwrap_or(max_rid).max(max_rid);
+
+                    state.pr_cursors.insert(pr_key.clone(), PrCursor {
+                        last_head_sha: pr.head_ref_oid.clone(),
+                        last_comment_id: new_max_comment,
+                        last_review_id: new_max_review,
+                        last_updated: Utc::now().to_rfc3339(),
+                    });
+                    dirty = true;
+
+                    let ctx = serde_json::json!({
+                        "repo": pr.repo,
+                        "pr_number": pr.number,
+                        "title": pr.title,
+                        "comments": new_ic.iter().map(|c| json!({
+                            "author": c.author.as_ref().map(|a| a.login.as_str()),
+                            "body": c.body,
+                        })).collect::<Vec<_>>(),
+                        "review_comments": new_rc.iter().map(|c| json!({
+                            "author": c.author.as_ref().map(|a| a.login.as_str()),
+                            "body": c.body,
+                        })).collect::<Vec<_>>(),
+                        "reviews": new_rv.iter().map(|r| json!({
+                            "author": r.user.as_ref().map(|u| u.login.as_str()),
+                            "state": r.state,
+                            "body": r.body,
+                        })).collect::<Vec<_>>(),
+                    });
+
+                    info!("  pr {}/{} — {} new authorized comment(s)", pr.repo, pr.number,
+                        new_ic.len() + new_rc.len() + new_rv.len());
+
+                    let config = config.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let label = format!("{}-pr-{}", ctx["repo"].as_str().unwrap(), ctx["pr_number"]);
+                        let dir = match ensure_task_dir(&config, &label).await {
+                            Ok(d) => d,
+                            Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                        };
+                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "pr-feedback", &label).await;
+                    });
+                }
+
+                if dirty {
+                    save_state(&config.state_file, &state).ok();
+                }
+            }
+            Err(e) => warn!("pr fetch failed: {e:#}"),
+        }
+
+        info!("sleeping {}s", config.poll_interval_secs);
+        tokio::time::sleep(Duration::from_secs(config.poll_interval_secs)).await;
+    }
+}
