@@ -21,9 +21,11 @@ You are running in an empty working directory. No repo is cloned yet — you own
 You must use git worktrees to isolate each task. Never work directly in the main clone.
 
 1. Clone the repo as a bare or shared base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. Create a worktree for this task: `git -C <base> worktree add --detach <worktree-path> origin/main`
-3. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-issue-{number}`.
-4. When you're done (PR opened and pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
+2. Determine the repo's default branch: `gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`
+3. Fetch the latest from origin: `git -C <base> fetch origin`
+4. Create a worktree for this task: `git -C <base> worktree add --detach <worktree-path> origin/<default-branch>`
+5. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-issue-{number}`.
+6. When you're done (PR opened and pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
 
 Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
 
@@ -38,7 +40,7 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 7. Commit with a concise, descriptive message.
 8. Push the branch: `git push origin bot/issue-{number}`
 9. Open a PR using `gh pr create`:
-   - Base: `main` (or the repo's default branch — check `gh repo view --json defaultBranchRef`)
+   - Base: the repo's default branch (from `gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`)
    - Title: use the issue title
    - Body: summarize the changes and include `Closes #{number}`
 10. Clean up the worktree.
