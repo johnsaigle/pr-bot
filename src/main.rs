@@ -18,7 +18,6 @@ use tracing::{debug, error, info, warn};
 struct Config {
     bot_username: String,
     authorized_user: String,
-    repos: Vec<String>,
     #[serde(default = "default_workflows_dir")]
     workflows_dir: PathBuf,
     #[serde(default = "default_cache_dir")]
@@ -157,7 +156,7 @@ fn is_authorized(author: &Option<GhAuthor>, config: &Config) -> bool {
 
 async fn fetch_assigned_issues(config: &Config) -> Result<Vec<GhIssue>> {
     let assignee = format!("@{}", config.bot_username);
-    let mut args: Vec<String> = vec![
+    let args: Vec<String> = vec![
         "issue".into(), "list".into(),
         "--assignee".into(), assignee,
         "--state".into(), "open".into(),
@@ -165,10 +164,6 @@ async fn fetch_assigned_issues(config: &Config) -> Result<Vec<GhIssue>> {
         "--json".into(), "number,title,body,nameWithOwner,createdAt,author".into(),
         "--limit".into(), "30".into(),
     ];
-    if config.repos.len() == 1 {
-        args.push("--repo".into());
-        args.push(config.repos[0].clone());
-    }
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
     serde_json::from_str(&stdout).context("Failed to parse gh issue list")
@@ -176,17 +171,13 @@ async fn fetch_assigned_issues(config: &Config) -> Result<Vec<GhIssue>> {
 
 async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
     let author = format!("@{}", config.bot_username);
-    let mut args: Vec<String> = vec![
+    let args: Vec<String> = vec![
         "pr".into(), "list".into(),
         "--author".into(), author,
         "--state".into(), "open".into(),
         "--json".into(), "number,title,headRefOid,nameWithOwner".into(),
         "--limit".into(), "30".into(),
     ];
-    if config.repos.len() == 1 {
-        args.push("--repo".into());
-        args.push(config.repos[0].clone());
-    }
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
     serde_json::from_str(&stdout).context("Failed to parse gh pr list")
@@ -316,8 +307,8 @@ async fn main() -> Result<()> {
         toml::from_str(&data).context("Failed to parse config")?
     };
 
-    info!("pr-bot starting. bot=@{} authorized=@{} repos={:?}",
-        config.bot_username, config.authorized_user, config.repos);
+    info!("pr-bot starting. bot=@{} authorized=@{}",
+        config.bot_username, config.authorized_user);
 
     let mut state = load_state(&config.state_file);
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
@@ -330,9 +321,7 @@ async fn main() -> Result<()> {
             Ok(issues) => {
                 let new: Vec<_> = issues.into_iter().filter(|i| {
                     let key = format!("{}/issues#{}", i.repo, i.number);
-                    let repo_match = config.repos.is_empty() || config.repos.contains(&i.repo);
-                    repo_match
-                        && is_authorized(&i.author, &config)
+                    is_authorized(&i.author, &config)
                         && !state.processed_issues.contains_key(&key)
                 }).collect();
 

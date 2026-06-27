@@ -2,7 +2,6 @@
 
 bot_username = "my-coder-bot"
 authorized_user = "your-real-username"
-repos = ["myorg/backend"]
 
 # Paths (defaults shown)
 # workflows_dir = "~/.config/pr-bot/workflows"
