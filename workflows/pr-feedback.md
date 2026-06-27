@@ -16,6 +16,11 @@ The session must not exit until every piece of new feedback has been addressed w
 
 No unrelated changes are introduced. If you exit without a commit or reply for each feedback item, the task has failed — the reviewer will never see your response.
 
+After all feedback is addressed, **unassign yourself** from the PR:
+```
+gh pr edit {number} --repo {repo} --remove-assignee @{bot_username}
+```
+
 ## Environment
 
 You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
@@ -34,16 +39,24 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 
 ## Workflow
 
-1. Read the task context provided in the prompt (JSON with `repo`, `pr_number`, `title`, `comments`, `review_comments`, `reviews`).
+1. Read the task context provided in the prompt (JSON with `repo`, `pr_number`, `title`, `bot_username`, `comments`, `review_comments`, `reviews`).
 2. Set up the worktree for this PR as described above.
-3. Read all review comments, inline comments, and reviews carefully.
-4. Make the requested changes. Be precise — address what was asked, nothing more.
-5. If a comment is unclear or you need more information, reply on the PR thread explaining what you need.
-6. Run any existing tests to verify your changes.
-7. Commit with a message that references the feedback, e.g. `address review: fix X as suggested`
-8. Push to the PR branch: `git push origin HEAD`
-9. If a review is marked `CHANGES_REQUESTED`, make sure all blocking issues are resolved.
-10. Clean up the worktree.
+3. **Assign yourself to the PR** so the reviewer knows you are addressing feedback:
+   ```
+   gh pr edit {pr_number} --repo {repo} --add-assignee @{bot_username}
+   ```
+4. Read all review comments, inline comments, and reviews carefully.
+5. Make the requested changes. Be precise — address what was asked, nothing more.
+6. If a comment is unclear or you need more information, reply on the PR thread explaining what you need.
+7. Run any existing tests to verify your changes.
+8. Commit with a message that references the feedback, e.g. `address review: fix X as suggested`
+9. Push to the PR branch: `git push origin HEAD`
+10. If a review is marked `CHANGES_REQUESTED`, make sure all blocking issues are resolved.
+11. **Unassign yourself from the PR** (all feedback addressed):
+    ```
+    gh pr edit {pr_number} --repo {repo} --remove-assignee @{bot_username}
+    ```
+12. Clean up the worktree.
 
 ## Constraints
 

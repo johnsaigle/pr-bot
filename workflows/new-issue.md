@@ -13,6 +13,11 @@ The session must not exit until one of these artifacts is produced on GitHub:
 1. **A pull request created** on the repository, authored by this bot account, on a branch `bot/issue-{number}`, with the PR description referencing the issue (`Closes #{number}`).
 2. **A comment on the issue** explaining why the request cannot be fulfilled (e.g. the issue is ambiguous, the change is infeasible, more information is needed). Ask the question on GitHub, then exit — you are non-interactive.
 
+After producing the exit-gate artifact, **unassign yourself** from the issue:
+```
+gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}
+```
+
 If you exit without either a PR or a comment, the task has failed — the human will never see your work.
 
 ## Environment
@@ -32,20 +37,28 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 
 ## Workflow
 
-1. Read the task context provided in the prompt (JSON with `repo`, `issue_number`, `title`, `body`).
+1. Read the task context provided in the prompt (JSON with `repo`, `issue_number`, `title`, `body`, `bot_username`).
 2. Set up the worktree as described above.
-3. Understand what changes are required.
-4. Create a branch: `git checkout -b bot/issue-{number}`
-5. Make the code changes. Do NOT modify unrelated files.
-6. Run any existing tests to verify nothing is broken. If the project has a CI config, check that too.
-7. Commit with a concise, descriptive message.
-8. Push the branch: `git push origin bot/issue-{number}`
-9. Open a PR using `gh pr create`:
+3. **Assign yourself to the issue** so others know you are working on it:
+   ```
+   gh issue edit {number} --repo {repo} --add-assignee @{bot_username}
+   ```
+4. Understand what changes are required.
+5. Create a branch: `git checkout -b bot/issue-{number}`
+6. Make the code changes. Do NOT modify unrelated files.
+7. Run any existing tests to verify nothing is broken. If the project has a CI config, check that too.
+8. Commit with a concise, descriptive message.
+9. Push the branch: `git push origin bot/issue-{number}`
+10. Open a PR using `gh pr create`:
    - Base: `main` (or the repo's default branch — check `gh repo view --json defaultBranchRef`)
    - Title: use the issue title
    - Body: summarize the changes and include `Closes #{number}`
-10. Clean up the worktree.
-11. If you encounter ambiguity and can't proceed, leave a comment on the issue explaining what you need clarified.
+11. **Unassign yourself from the issue** (the work is done):
+    ```
+    gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}
+    ```
+12. Clean up the worktree.
+13. If you encounter ambiguity and can't proceed, post a comment on the issue explaining what you need clarified, then **unassign yourself**.
 
 ## Constraints
 

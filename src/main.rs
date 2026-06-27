@@ -417,6 +417,7 @@ async fn main() -> Result<()> {
                         "title": issue.title,
                         "body": issue.body,
                         "author": issue.author.map(|a| a.login),
+                        "bot_username": config.bot_username,
                     });
 
                     let config = config.clone();
@@ -487,6 +488,7 @@ async fn main() -> Result<()> {
                         "repo": pr.repo,
                         "pr_number": pr.number,
                         "title": pr.title,
+                        "bot_username": config.bot_username,
                         "comments": new_ic.iter().map(|c| json!({
                             "author": c.author.as_ref().map(|a| a.login.as_str()),
                             "body": c.body,
@@ -553,6 +555,7 @@ async fn main() -> Result<()> {
                                         "type": kind,
                                         "source": "body",
                                         "url": item.html_url,
+                                        "bot_username": config.bot_username,
                                     });
 
                                     let label = format!("{}-{}-{}-body", repo, kind.to_lowercase(), num);
@@ -589,6 +592,7 @@ async fn main() -> Result<()> {
                                     "type": kind,
                                     "source": "comment",
                                     "url": item.html_url,
+                                    "bot_username": config.bot_username,
                                 });
 
                                 let label = format!("{}-{}-{}-comment-{}", repo, kind.to_lowercase(), num, comment.id);

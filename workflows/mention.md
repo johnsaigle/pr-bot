@@ -18,6 +18,12 @@ The session must not exit until a meaningful artifact is posted to the GitHub th
 
 If you exit without posting on GitHub, the task has failed — the human will never see your work.
 
+After producing the exit-gate artifact, **unassign yourself** from the issue or PR:
+```
+gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}
+```
+(Use `gh pr edit` instead of `gh issue edit` if the thread is a pull request.)
+
 You may read context (parent issue/PR body, prior comments, review state, referenced files) as part of your work, but reading is not a deliverable. The exit gate is the artifact.
 
 ## Environment
@@ -37,7 +43,7 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 
 ## Workflow
 
-1. Read the task context provided in the prompt (JSON with `repo`, `number`, `title`, `body`, `author`, `type`, `reason`, `url`). The `type` is one of `Issue`, `PullRequest`, or other GitHub notification subject types.
+1. Read the task context provided in the prompt (JSON with `repo`, `number`, `title`, `body`, `author`, `bot_username`, `type`, `source`, `url`). The `type` is one of `Issue`, `PullRequest`, or other GitHub notification subject types.
 2. **Gather surrounding context before doing anything else.** Use `gh` to fetch:
    - The full thread body of the parent issue/PR: `gh issue view {number}` or `gh pr view {number}`.
    - All prior comments on the thread: `gh api /repos/{repo}/issues/{number}/comments`.
@@ -50,13 +56,19 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
    - **Fix in an existing PR** — check out the PR branch (`git fetch origin pull/{number}/head:refs/heads/pr-{number}`) and push fixes to it.
    - **Implement a new change** — branch from `main` as `bot/mention-{number}`, make the change, and open a PR referencing the thread (`Refs #{number}`).
    - **Follow up on a review** — treat like the `pr-feedback` workflow.
-5. Set up the worktree accordingly.
-6. Make the smallest change that satisfies the request. Do NOT refactor or touch unrelated files.
-7. Run any existing tests to verify your changes.
-8. If you opened a PR, push the branch and use `gh pr create` with a body that includes `Refs #{number}` (or `Closes #{number}` if the user explicitly asked to close the thread).
-9. Reply on the original thread summarizing what you did and linking any PR. If you only investigated, post your findings as a comment.
-10. Clean up the worktree.
-11. If the request is ambiguous or you lack information to proceed safely, post a comment on the thread asking for clarification, then exit. Do not block waiting for a reply — you are non-interactive.
+5. **Assign yourself** to the issue or PR so others know you are working on it:
+   - For an issue: `gh issue edit {number} --repo {repo} --add-assignee @{bot_username}`
+   - For a PR: `gh pr edit {number} --repo {repo} --add-assignee @{bot_username}`
+6. Set up the worktree accordingly.
+7. Make the smallest change that satisfies the request. Do NOT refactor or touch unrelated files.
+8. Run any existing tests to verify your changes.
+9. If you opened a PR, push the branch and use `gh pr create` with a body that includes `Refs #{number}` (or `Closes #{number}` if the user explicitly asked to close the thread).
+10. Reply on the original thread summarizing what you did and linking any PR. If you only investigated, post your findings as a comment.
+11. **Unassign yourself** from the issue or PR:
+    - Issue: `gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}`
+    - PR: `gh pr edit {number} --repo {repo} --remove-assignee @{bot_username}`
+12. Clean up the worktree.
+13. If the request is ambiguous or you lack information to proceed safely, post a comment on the thread asking for clarification, then **unassign yourself** and exit. Do not block waiting for a reply — you are non-interactive.
 
 ## Constraints
 
