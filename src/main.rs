@@ -280,7 +280,7 @@ async fn fetch_pr_reviews(config: &Config, repo: &str, pr_number: u64) -> Result
 async fn fetch_mentions(config: &Config) -> Result<Vec<GhNotification>> {
     let args: Vec<String> = vec![
         "api".into(), "/notifications".into(),
-        "--field".into(), "all=false".into(),
+        "--method".into(), "GET".into(),
         "--jq".into(), ".".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
