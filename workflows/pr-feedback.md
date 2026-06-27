@@ -45,18 +45,22 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
    ```
    gh pr edit {pr_number} --repo {repo} --add-assignee @{bot_username}
    ```
-4. Read all review comments, inline comments, and reviews carefully.
-5. Make the requested changes. Be precise — address what was asked, nothing more.
-6. If a comment is unclear or you need more information, reply on the PR thread explaining what you need.
-7. Run any existing tests to verify your changes.
-8. Commit with a message that references the feedback, e.g. `address review: fix X as suggested`
-9. Push to the PR branch: `git push origin HEAD`
-10. If a review is marked `CHANGES_REQUESTED`, make sure all blocking issues are resolved.
-11. **Unassign yourself from the PR** (all feedback addressed):
+4. Rebase the PR branch onto the latest default branch to prevent sync/rebase issues:
+   - Find the default branch: `gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`
+   - Fetch and rebase: `git fetch origin <default-branch> && git rebase origin/<default-branch>`
+   - If the rebase has conflicts, resolve them carefully without changing unrelated code.
+5. Read all review comments, inline comments, and reviews carefully.
+6. Make the requested changes. Be precise — address what was asked, nothing more.
+7. If a comment is unclear or you need more information, reply on the PR thread explaining what you need.
+8. Run any existing tests to verify your changes.
+9. Commit with a message that references the feedback, e.g. `address review: fix X as suggested`
+10. Push to the PR branch: `git push origin HEAD`
+11. If a review is marked `CHANGES_REQUESTED`, make sure all blocking issues are resolved.
+12. **Unassign yourself from the PR** (all feedback addressed):
     ```
     gh pr edit {pr_number} --repo {repo} --remove-assignee @{bot_username}
     ```
-12. Clean up the worktree.
+13. Clean up the worktree.
 
 ## Constraints
 
