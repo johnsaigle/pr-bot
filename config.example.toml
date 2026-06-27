@@ -12,3 +12,8 @@ authorized_user = "your-real-username"
 # poll_interval_secs = 300
 # task_timeout_secs = 1800
 # model = "anthropic/claude-sonnet-4"
+
+# Poll the GitHub notifications API for mentions/assignments on any repo
+# the bot account can read (no per-repo collaborator setup required).
+# poll_mentions = true
+# mention_reasons = ["mention", "assign"]

@@ -35,6 +35,10 @@ struct Config {
     model: Option<String>,
     #[serde(default = "default_task_timeout")]
     task_timeout_secs: u64,
+    #[serde(default = "default_true")]
+    poll_mentions: bool,
+    #[serde(default = "default_mention_reasons")]
+    mention_reasons: Vec<String>,
 }
 
 fn default_workflows_dir() -> PathBuf {
@@ -51,6 +55,8 @@ fn default_opencode() -> PathBuf { PathBuf::from("opencode") }
 fn default_gh() -> String { "gh".into() }
 const fn default_poll_interval() -> u64 { 300 }
 const fn default_task_timeout() -> u64 { 1800 }
+fn default_true() -> bool { true }
+fn default_mention_reasons() -> Vec<String> { vec!["mention".into(), "assign".into()] }
 
 // ─── State ────────────────────────────────────────────
 
@@ -58,6 +64,7 @@ const fn default_task_timeout() -> u64 { 1800 }
 struct State {
     processed_issues: HashMap<String, String>,
     pr_cursors: HashMap<String, PrCursor>,
+    processed_mentions: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -137,6 +144,42 @@ struct GhReview {
 #[derive(Debug, Deserialize, Clone)]
 struct GhAuthor {
     login: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GhNotification {
+    id: String,
+    reason: String,
+    #[serde(rename = "updated_at")]
+    updated_at: String,
+    subject: GhNotificationSubject,
+    repository: GhNotificationRepo,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct GhNotificationSubject {
+    title: String,
+    url: String,
+    #[serde(rename = "type")]
+    subject_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhNotificationRepo {
+    #[serde(rename = "full_name")]
+    full_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhSubject {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    #[serde(rename = "html_url")]
+    html_url: String,
+    user: Option<GhAuthor>,
 }
 
 // ─── Helpers ──────────────────────────────────────────
@@ -232,6 +275,40 @@ async fn fetch_pr_reviews(config: &Config, repo: &str, pr_number: u64) -> Result
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
     serde_json::from_str(&stdout).context("Failed to parse reviews")
+}
+
+async fn fetch_mentions(config: &Config) -> Result<Vec<GhNotification>> {
+    let args: Vec<String> = vec![
+        "api".into(), "/notifications".into(),
+        "--field".into(), "all=false".into(),
+        "--jq".into(), ".".into(),
+    ];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
+    let all: Vec<GhNotification> = serde_json::from_str(&stdout)
+        .context("Failed to parse notifications")?;
+    let reasons: Vec<&str> = if config.mention_reasons.is_empty() {
+        vec!["mention"]
+    } else {
+        config.mention_reasons.iter().map(|s| s.as_str()).collect()
+    };
+    Ok(all.into_iter().filter(|n| reasons.contains(&n.reason.as_str())).collect())
+}
+
+async fn fetch_subject(config: &Config, url: &str) -> Result<GhSubject> {
+    let args: Vec<String> = vec!["api".into(), url.into(), "--jq".into(), ".".into()];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    serde_json::from_str(&stdout).context("Failed to parse subject")
+}
+
+async fn mark_notification_read(config: &Config, id: &str) {
+    let endpoint = format!("/notifications/threads/{id}");
+    let args: Vec<String> = vec![
+        "api".into(), "--method".into(), "PATCH".into(), endpoint, "--silent".into(),
+    ];
+    if let Err(e) = run_cmd(&config.gh_bin, &args).await {
+        debug!("mark-read failed for {id}: {e:#}");
+    }
 }
 
 // ─── Task directory ───────────────────────────────────
@@ -473,6 +550,69 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => warn!("pr fetch failed: {e:#}"),
+        }
+
+        // ── 3. Mentions via notifications API (author-gated) ──
+        if config.poll_mentions {
+            match fetch_mentions(&config).await {
+                Ok(notifs) => {
+                    let new: Vec<_> = notifs.into_iter()
+                        .filter(|n| !state.processed_mentions.contains_key(&n.id))
+                        .collect();
+
+                    if !new.is_empty() {
+                        info!("{} new mention notification(s)", new.len());
+                    }
+
+                    for n in new {
+                        let subject = match fetch_subject(&config, &n.subject.url).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("subject fetch failed for {}: {e:#}", n.id);
+                                continue;
+                            }
+                        };
+
+                        if !is_authorized(&subject.user, &config) {
+                            state.processed_mentions.insert(n.id.clone(), Utc::now().to_rfc3339());
+                            continue;
+                        }
+
+                        state.processed_mentions.insert(n.id.clone(), Utc::now().to_rfc3339());
+                        let kind = n.subject.subject_type.clone();
+                        let repo = n.repository.full_name.clone();
+                        let num = subject.number;
+                        info!("  mention {repo}#{num} ({kind})");
+
+                        let ctx = serde_json::json!({
+                            "repo": repo,
+                            "number": num,
+                            "title": subject.title,
+                            "body": subject.body,
+                            "author": subject.user.as_ref().map(|a| a.login.as_str()),
+                            "type": kind,
+                            "reason": n.reason,
+                            "url": subject.html_url,
+                        });
+
+                        let label = format!("{}-{}-{}", repo, kind.to_lowercase(), num);
+                        mark_notification_read(&config, &n.id).await;
+                        let config = config.clone();
+                        let permit = semaphore.clone().acquire_owned().await.unwrap();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let dir = match ensure_task_dir(&config, &label).await {
+                                Ok(d) => d,
+                                Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                            };
+                            let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
+                        });
+                    }
+
+                    save_state(&config.state_file, &state).ok();
+                }
+                Err(e) => warn!("mentions fetch failed: {e:#}"),
+            }
         }
 
         info!("sleeping {}s", config.poll_interval_secs);
