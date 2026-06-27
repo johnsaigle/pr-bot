@@ -37,8 +37,6 @@ struct Config {
     task_timeout_secs: u64,
     #[serde(default = "default_true")]
     poll_mentions: bool,
-    #[serde(default = "default_mention_reasons")]
-    mention_reasons: Vec<String>,
 }
 
 fn default_workflows_dir() -> PathBuf {
@@ -56,7 +54,6 @@ fn default_gh() -> String { "gh".into() }
 const fn default_poll_interval() -> u64 { 300 }
 const fn default_task_timeout() -> u64 { 1800 }
 fn default_true() -> bool { true }
-fn default_mention_reasons() -> Vec<String> { vec!["mention".into(), "assign".into()] }
 
 // ─── State ────────────────────────────────────────────
 
@@ -147,39 +144,15 @@ struct GhAuthor {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct GhNotification {
-    id: String,
-    reason: String,
-    #[serde(rename = "updated_at")]
-    updated_at: String,
-    subject: GhNotificationSubject,
-    repository: GhNotificationRepo,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct GhNotificationSubject {
-    title: String,
-    url: String,
-    #[serde(rename = "type")]
-    subject_type: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhNotificationRepo {
-    #[serde(rename = "full_name")]
-    full_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhSubject {
+struct GhSearchItem {
     number: u64,
     title: String,
     body: Option<String>,
     #[serde(rename = "html_url")]
     html_url: String,
     user: Option<GhAuthor>,
+    #[serde(rename = "pull_request")]
+    pull_request: Option<serde_json::Value>,
 }
 
 // ─── Helpers ──────────────────────────────────────────
@@ -277,38 +250,38 @@ async fn fetch_pr_reviews(config: &Config, repo: &str, pr_number: u64) -> Result
     serde_json::from_str(&stdout).context("Failed to parse reviews")
 }
 
-async fn fetch_mentions(config: &Config) -> Result<Vec<GhNotification>> {
+async fn fetch_mentions(config: &Config) -> Result<Vec<GhSearchItem>> {
+    let query = format!("mentions:@{} is:open", config.bot_username);
     let args: Vec<String> = vec![
-        "api".into(), "/notifications".into(),
+        "api".into(), "/search/issues".into(),
         "--method".into(), "GET".into(),
-        "--jq".into(), ".".into(),
+        "-f".into(), format!("q={query}").into(),
+        "-f".into(), "sort=updated".into(),
+        "-f".into(), "order=desc".into(),
+        "-f".into(), "per_page=30".into(),
+        "--jq".into(), ".items".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
-    let all: Vec<GhNotification> = serde_json::from_str(&stdout)
-        .context("Failed to parse notifications")?;
-    let reasons: Vec<&str> = if config.mention_reasons.is_empty() {
-        vec!["mention"]
-    } else {
-        config.mention_reasons.iter().map(|s| s.as_str()).collect()
-    };
-    Ok(all.into_iter().filter(|n| reasons.contains(&n.reason.as_str())).collect())
+    serde_json::from_str(&stdout).context("Failed to parse search results")
 }
 
-async fn fetch_subject(config: &Config, url: &str) -> Result<GhSubject> {
-    let args: Vec<String> = vec!["api".into(), url.into(), "--jq".into(), ".".into()];
-    let stdout = run_cmd(&config.gh_bin, &args).await?;
-    serde_json::from_str(&stdout).context("Failed to parse subject")
-}
-
-async fn mark_notification_read(config: &Config, id: &str) {
-    let endpoint = format!("/notifications/threads/{id}");
-    let args: Vec<String> = vec![
-        "api".into(), "--method".into(), "PATCH".into(), endpoint, "--silent".into(),
-    ];
-    if let Err(e) = run_cmd(&config.gh_bin, &args).await {
-        debug!("mark-read failed for {id}: {e:#}");
+fn contains_mention(body: &str, username: &str) -> bool {
+    let needle = format!("@{username}");
+    let mut start = 0usize;
+    while let Some(pos) = body[start..].find(&needle) {
+        let abs = start + pos;
+        let after = abs + needle.len();
+        let boundary = match body.get(after..).and_then(|s| s.chars().next()) {
+            None => true,
+            Some(c) => !c.is_alphanumeric() && c != '-' && c != '_',
+        };
+        if boundary {
+            return true;
+        }
+        start = abs + 1;
     }
+    false
 }
 
 // ─── Task directory ───────────────────────────────────
@@ -552,61 +525,85 @@ async fn main() -> Result<()> {
             Err(e) => warn!("pr fetch failed: {e:#}"),
         }
 
-        // ── 3. Mentions via notifications API (author-gated) ──
+        // ── 3. Mentions via search API (author-gated) ──
         if config.poll_mentions {
             match fetch_mentions(&config).await {
-                Ok(notifs) => {
-                    let new: Vec<_> = notifs.into_iter()
-                        .filter(|n| !state.processed_mentions.contains_key(&n.id))
-                        .collect();
+                Ok(items) => {
+                    let bot = &config.bot_username;
 
-                    if !new.is_empty() {
-                        info!("{} new mention notification(s)", new.len());
-                    }
+                    for item in &items {
+                        let repo = repo_from_url(&item.html_url);
+                        let num = item.number;
+                        let is_pr = item.pull_request.is_some();
+                        let kind = if is_pr { "PullRequest" } else { "Issue" };
 
-                    for n in new {
-                        let subject = match fetch_subject(&config, &n.subject.url).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!("subject fetch failed for {}: {e:#}", n.id);
-                                continue;
+                        let body_key = format!("{repo}#{num}#body");
+                        if !state.processed_mentions.contains_key(&body_key) {
+                            if let Some(ref body) = item.body {
+                                if contains_mention(body, bot) && is_authorized(&item.user, &config) {
+                                    state.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
+                                    info!("  mention {repo}#{num} ({kind} body)");
+
+                                    let ctx = serde_json::json!({
+                                        "repo": repo,
+                                        "number": num,
+                                        "title": item.title,
+                                        "body": body,
+                                        "author": item.user.as_ref().map(|a| a.login.as_str()),
+                                        "type": kind,
+                                        "source": "body",
+                                        "url": item.html_url,
+                                    });
+
+                                    let label = format!("{}-{}-{}-body", repo, kind.to_lowercase(), num);
+                                    let config = config.clone();
+                                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let dir = match ensure_task_dir(&config, &label).await {
+                                            Ok(d) => d,
+                                            Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                                        };
+                                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
+                                    });
+                                }
                             }
-                        };
-
-                        if !is_authorized(&subject.user, &config) {
-                            state.processed_mentions.insert(n.id.clone(), Utc::now().to_rfc3339());
-                            continue;
                         }
 
-                        state.processed_mentions.insert(n.id.clone(), Utc::now().to_rfc3339());
-                        let kind = n.subject.subject_type.clone();
-                        let repo = n.repository.full_name.clone();
-                        let num = subject.number;
-                        info!("  mention {repo}#{num} ({kind})");
+                        let comments = fetch_pr_issue_comments(&config, &repo, num).await.unwrap_or_default();
+                        for comment in &comments {
+                            let ckey = format!("{repo}#{num}#comment-{}", comment.id);
+                            if !state.processed_mentions.contains_key(&ckey)
+                                && contains_mention(&comment.body, bot)
+                                && is_authorized(&comment.author, &config)
+                            {
+                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
 
-                        let ctx = serde_json::json!({
-                            "repo": repo,
-                            "number": num,
-                            "title": subject.title,
-                            "body": subject.body,
-                            "author": subject.user.as_ref().map(|a| a.login.as_str()),
-                            "type": kind,
-                            "reason": n.reason,
-                            "url": subject.html_url,
-                        });
+                                let ctx = serde_json::json!({
+                                    "repo": repo,
+                                    "number": num,
+                                    "title": item.title,
+                                    "body": comment.body,
+                                    "author": comment.author.as_ref().map(|a| a.login.as_str()),
+                                    "type": kind,
+                                    "source": "comment",
+                                    "url": item.html_url,
+                                });
 
-                        let label = format!("{}-{}-{}", repo, kind.to_lowercase(), num);
-                        mark_notification_read(&config, &n.id).await;
-                        let config = config.clone();
-                        let permit = semaphore.clone().acquire_owned().await.unwrap();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let dir = match ensure_task_dir(&config, &label).await {
-                                Ok(d) => d,
-                                Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
-                            };
-                            let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
-                        });
+                                let label = format!("{}-{}-{}-comment-{}", repo, kind.to_lowercase(), num, comment.id);
+                                let config = config.clone();
+                                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let dir = match ensure_task_dir(&config, &label).await {
+                                        Ok(d) => d,
+                                        Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                                    };
+                                    let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
+                                });
+                            }
+                        }
                     }
 
                     save_state(&config.state_file, &state).ok();
