@@ -310,6 +310,23 @@ fn contains_mention(body: &str, username: &str) -> bool {
     false
 }
 
+// ─── Reactions ────────────────────────────────────────
+
+async fn add_eyes_reaction(config: &Config, repo: &str, number: u64) {
+    let endpoint = format!("/repos/{repo}/issues/{number}/reactions");
+    let args: Vec<String> = vec![
+        "api".into(),
+        "--method".into(), "POST".into(),
+        endpoint,
+        "-f".into(), "content=eyes".into(),
+        "--silent".into(),
+    ];
+    match run_cmd(&config.gh_bin, &args).await {
+        Ok(_) => info!("  👀 {repo}#{number}"),
+        Err(e) => debug!("failed to add 👀 reaction to {repo}#{number}: {e:#}"),
+    }
+}
+
 // ─── Task directory ───────────────────────────────────
 
 async fn ensure_task_dir(config: &Config, label: &str) -> Result<PathBuf> {
@@ -436,6 +453,8 @@ async fn main() -> Result<()> {
                     let key = format!("{}/issues#{}", issue.repo, issue.number);
                     state.processed_issues.insert(key.clone(), Utc::now().to_rfc3339());
                     info!("  issue {repo}#{num}", repo = issue.repo, num = issue.number);
+
+                    add_eyes_reaction(&config, &issue.repo, issue.number).await;
 
                     let ctx = serde_json::json!({
                         "repo": issue.repo,
@@ -592,6 +611,8 @@ async fn main() -> Result<()> {
                     info!("  pr {}/{} — {} new authorized comment(s)", pr.repo, pr.number,
                         new_ic.len() + new_rc.len() + new_rv.len());
 
+                    add_eyes_reaction(&config, &pr.repo, pr.number).await;
+
                     let config = config.clone();
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     tokio::spawn(async move {
@@ -631,6 +652,8 @@ async fn main() -> Result<()> {
                                     state.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
                                     info!("  mention {repo}#{num} ({kind} body)");
 
+                                    add_eyes_reaction(&config, &repo, num).await;
+
                                     let ctx = serde_json::json!({
                                         "repo": repo,
                                         "number": num,
@@ -667,6 +690,8 @@ async fn main() -> Result<()> {
                             {
                                 state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
                                 info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
+
+                                add_eyes_reaction(&config, &repo, num).await;
 
                                 let ctx = serde_json::json!({
                                     "repo": repo,
