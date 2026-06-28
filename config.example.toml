@@ -10,6 +10,7 @@ authorized_user = "your-real-username"
 
 # max_concurrent = 3
 # poll_interval_secs = 300
+# health_check_interval_secs = 60
 # task_timeout_secs = 1800
 # model = "anthropic/claude-sonnet-4"
 
