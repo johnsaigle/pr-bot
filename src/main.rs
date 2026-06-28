@@ -252,6 +252,39 @@ async fn fetch_bot_issues(config: &Config) -> Result<Vec<GhIssue>> {
     Ok(issues)
 }
 
+async fn fetch_authorized_issues(config: &Config) -> Result<Vec<GhIssue>> {
+    let author = format!("@{}", config.authorized_user);
+    let args: Vec<String> = vec![
+        "issue".into(), "list".into(),
+        "--author".into(), author,
+        "--state".into(), "open".into(),
+        "--search".into(), "is:issue".into(),
+        "--json".into(), "number,title,body,url,createdAt,author".into(),
+        "--limit".into(), "30".into(),
+    ];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout.is_empty() { return Ok(vec![]); }
+    let mut issues: Vec<GhIssue> = serde_json::from_str(&stdout).context("Failed to parse gh issue list")?;
+    for issue in &mut issues {
+        issue.repo = repo_from_url(&issue.url);
+    }
+    Ok(issues)
+}
+
+async fn fetch_authorized_prs(config: &Config) -> Result<Vec<GhPr>> {
+    let author = format!("@{}", config.authorized_user);
+    let args: Vec<String> = vec![
+        "pr".into(), "list".into(),
+        "--author".into(), author,
+        "--state".into(), "open".into(),
+        "--json".into(), "number,title,headRefOid,headRepository".into(),
+        "--limit".into(), "30".into(),
+    ];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout.is_empty() { return Ok(vec![]); }
+    serde_json::from_str(&stdout).context("Failed to parse gh pr list")
+}
+
 async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
     let endpoint = format!("/repos/{repo}/issues/{pr_number}/comments");
     let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
@@ -648,8 +681,146 @@ async fn main() -> Result<()> {
             Err(e) => warn!("pr fetch failed: {e:#}"),
         }
 
-// ── 3. Mentions via search API (author-gated) ──
+        // ── 4. Mentions via search API (author-gated) ──
         if config.poll_mentions {
+            // ── 4a. Proactive: scan authorized user's issue/PR comment threads ──
+            // Checks comments on threads the authorized user created, so the bot
+            // picks up mentions that happen later in the lifecycle, even if the
+            // search API hasn't indexed them yet.
+            {
+                match fetch_authorized_issues(&config).await {
+                    Ok(issues) => {
+                        let bot = &config.bot_username;
+                        let mut dirty = false;
+
+                        info!("[mentions] scanning {} authorized user issue(s) for comment mentions",
+                            issues.len());
+
+                        for issue in &issues {
+                            let comments = fetch_pr_issue_comments(&config, &issue.repo, issue.number)
+                                .await.unwrap_or_default();
+                            for comment in &comments {
+                                let ckey = format!("{}#{}#comment-{}", issue.repo, issue.number, comment.id);
+                                if state.processed_mentions.contains_key(&ckey) {
+                                    continue;
+                                }
+                                if !contains_mention(&comment.body, bot) {
+                                    continue;
+                                }
+                                if !is_authorized(&comment.author, &config) {
+                                    info!("[mentions] skip {}#{} comment {} — author not authorized",
+                                        issue.repo, issue.number, comment.id);
+                                    continue;
+                                }
+                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                dirty = true;
+                                info!("[mentions] {}#{} issue comment {} — mention found",
+                                    issue.repo, issue.number, comment.id);
+
+                                add_eyes_reaction(&config, &issue.repo, issue.number).await;
+
+                                let ctx = serde_json::json!({
+                                    "repo": issue.repo,
+                                    "number": issue.number,
+                                    "title": issue.title,
+                                    "body": comment.body,
+                                    "author": comment.author.as_ref().map(|a| a.login.as_str()),
+                                    "type": "Issue",
+                                    "source": "comment",
+                                    "url": issue.url,
+                                    "bot_username": config.bot_username,
+                                });
+
+                                let label = format!("{}-auth-issue-{}-comment-{}",
+                                    issue.repo, issue.number, comment.id);
+                                let config = config.clone();
+                                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let dir = match ensure_task_dir(&config, &label).await {
+                                        Ok(d) => d,
+                                        Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                                    };
+                                    let _ = launch_opencode(&config, &dir, &ctx.to_string(),
+                                        "mention", &label).await;
+                                });
+                            }
+                        }
+
+                        if dirty {
+                            save_state(&config.state_file, &state).ok();
+                        }
+                    }
+                    Err(e) => warn!("auth issues fetch failed: {e:#}"),
+                }
+
+                match fetch_authorized_prs(&config).await {
+                    Ok(prs) => {
+                        let bot = &config.bot_username;
+                        let mut dirty = false;
+
+                        info!("[mentions] scanning {} authorized user PR(s) for comment mentions",
+                            prs.len());
+
+                        for pr in &prs {
+                            let comments = fetch_pr_issue_comments(&config, &pr.repo, pr.number)
+                                .await.unwrap_or_default();
+                            for comment in &comments {
+                                let ckey = format!("{}#{}#comment-{}", pr.repo, pr.number, comment.id);
+                                if state.processed_mentions.contains_key(&ckey) {
+                                    continue;
+                                }
+                                if !contains_mention(&comment.body, bot) {
+                                    continue;
+                                }
+                                if !is_authorized(&comment.author, &config) {
+                                    info!("[mentions] skip {}#{} pr comment {} — author not authorized",
+                                        pr.repo, pr.number, comment.id);
+                                    continue;
+                                }
+                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                dirty = true;
+                                info!("[mentions] {}#{} pr comment {} — mention found",
+                                    pr.repo, pr.number, comment.id);
+
+                                add_eyes_reaction(&config, &pr.repo, pr.number).await;
+
+                                let ctx = serde_json::json!({
+                                    "repo": pr.repo,
+                                    "number": pr.number,
+                                    "title": pr.title,
+                                    "body": comment.body,
+                                    "author": comment.author.as_ref().map(|a| a.login.as_str()),
+                                    "type": "PullRequest",
+                                    "source": "comment",
+                                    "url": format!("https://github.com/{}/pull/{}", pr.repo, pr.number),
+                                    "bot_username": config.bot_username,
+                                });
+
+                                let label = format!("{}-auth-pr-{}-comment-{}",
+                                    pr.repo, pr.number, comment.id);
+                                let config = config.clone();
+                                let permit = semaphore.clone().acquire_owned().await.unwrap();
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    let dir = match ensure_task_dir(&config, &label).await {
+                                        Ok(d) => d,
+                                        Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                                    };
+                                    let _ = launch_opencode(&config, &dir, &ctx.to_string(),
+                                        "mention", &label).await;
+                                });
+                            }
+                        }
+
+                        if dirty {
+                            save_state(&config.state_file, &state).ok();
+                        }
+                    }
+                    Err(e) => warn!("auth prs fetch failed: {e:#}"),
+                }
+            }
+            // ── 4b. Search API (fallback / broad catch-all) ──
             match fetch_mentions(&config).await {
                 Ok(items) => {
                     let bot = &config.bot_username;
