@@ -439,14 +439,22 @@ async fn main() -> Result<()> {
         // ── 1. Assigned issues (author-gated) ──
         match fetch_assigned_issues(&config).await {
             Ok(issues) => {
+                info!("[issues] fetched {} assigned issue(s)", issues.len());
                 let new: Vec<_> = issues.into_iter().filter(|i| {
                     let key = format!("{}/issues#{}", i.repo, i.number);
-                    is_authorized(&i.author, &config)
-                        && !state.processed_issues.contains_key(&key)
+                    let authorized = is_authorized(&i.author, &config);
+                    let processed = state.processed_issues.contains_key(&key);
+                    if !authorized {
+                        info!("[issues] skip {}/{} — author '{}' not authorized", i.repo, i.number,
+                            i.author.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
+                    } else if processed {
+                        info!("[issues] skip {}/{} — already processed", i.repo, i.number);
+                    }
+                    authorized && !processed
                 }).collect();
 
                 if !new.is_empty() {
-                    info!("{} new authorized issue(s)", new.len());
+                    info!("[issues] {} new authorized issue(s)", new.len());
                 }
 
                 for issue in new {
@@ -548,6 +556,7 @@ async fn main() -> Result<()> {
         // ── 3. PR feedback (author-gated) ──
         match fetch_open_prs(&config).await {
             Ok(prs) => {
+                info!("[pr-feedback] fetched {} open PR(s)", prs.len());
                 let mut dirty = false;
 
                 for pr in prs {
@@ -572,6 +581,11 @@ async fn main() -> Result<()> {
                         .cloned().collect();
 
                     if new_ic.is_empty() && new_rc.is_empty() && new_rv.is_empty() {
+                        info!("[pr-feedback] skip {}/{} — {} ic, {} rc, {} rv total; {} ic, {} rc, {} rv after cursor; 0 authorized",
+                            pr.repo, pr.number, ic.len(), rc.len(), rv.len(),
+                            ic.iter().filter(|c| c.id > max_cid).count(),
+                            rc.iter().filter(|c| c.id > max_cid).count(),
+                            rv.iter().filter(|r| r.id > max_rid).count());
                         continue;
                     }
 
@@ -608,8 +622,9 @@ async fn main() -> Result<()> {
                         })).collect::<Vec<_>>(),
                     });
 
-                    info!("  pr {}/{} — {} new authorized comment(s)", pr.repo, pr.number,
-                        new_ic.len() + new_rc.len() + new_rv.len());
+                    info!("[pr-feedback] pr {}/{} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
+                        pr.repo, pr.number, new_ic.len() + new_rc.len() + new_rv.len(),
+                        new_ic.len(), new_rc.len(), new_rv.len());
 
                     add_eyes_reaction(&config, &pr.repo, pr.number).await;
 
@@ -638,6 +653,7 @@ async fn main() -> Result<()> {
             match fetch_mentions(&config).await {
                 Ok(items) => {
                     let bot = &config.bot_username;
+                    info!("[mentions] fetched {} search result(s)", items.len());
 
                     for item in &items {
                         let repo = repo_from_url(&item.html_url);
@@ -648,9 +664,16 @@ async fn main() -> Result<()> {
                         let body_key = format!("{repo}#{num}#body");
                         if !state.processed_mentions.contains_key(&body_key) {
                             if let Some(ref body) = item.body {
-                                if contains_mention(body, bot) && is_authorized(&item.user, &config) {
+                                let has_mention = contains_mention(body, bot);
+                                let authorized = is_authorized(&item.user, &config);
+                                if !has_mention {
+                                    info!("[mentions] skip {repo}#{num} body — no @{} mention found", bot);
+                                } else if !authorized {
+                                    info!("[mentions] skip {repo}#{num} body — author '{}' not authorized",
+                                        item.user.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
+                                } else {
                                     state.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
-                                    info!("  mention {repo}#{num} ({kind} body)");
+                                    info!("[mentions] {repo}#{num} ({kind} body)");
 
                                     add_eyes_reaction(&config, &repo, num).await;
 
@@ -682,14 +705,25 @@ async fn main() -> Result<()> {
                         }
 
                         let comments = fetch_pr_issue_comments(&config, &repo, num).await.unwrap_or_default();
+                        info!("[mentions] {repo}#{num} — {} comment(s) to scan", comments.len());
                         for comment in &comments {
                             let ckey = format!("{repo}#{num}#comment-{}", comment.id);
-                            if !state.processed_mentions.contains_key(&ckey)
-                                && contains_mention(&comment.body, bot)
-                                && is_authorized(&comment.author, &config)
+                            if state.processed_mentions.contains_key(&ckey) {
+                                continue;
+                            }
+                            let has_mention = contains_mention(&comment.body, bot);
+                            let authorized = is_authorized(&comment.author, &config);
+                            if !has_mention {
+                                continue;
+                            }
+                            if !authorized {
+                                info!("[mentions] skip {repo}#{num} comment {} — author '{}' not authorized",
+                                    comment.id, comment.author.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
+                                continue;
+                            }
                             {
                                 state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
-                                info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
+                                info!("[mentions] {repo}#{num} ({kind} comment {})", comment.id);
 
                                 add_eyes_reaction(&config, &repo, num).await;
 
