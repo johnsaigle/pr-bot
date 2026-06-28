@@ -25,15 +25,20 @@ gh pr edit {number} --repo {repo} --remove-assignee @{bot_username}
 
 You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
 
+### Fork setup (required)
+
+The bot account typically does NOT have push access to `{repo}`. PR branches live on the bot's fork (`{bot_username}/<repo-name>`), not on the upstream.
+
 ### Worktree isolation (required)
 
 You must use git worktrees to isolate each PR. Never work directly in the main clone.
 
-1. Clone the repo as a bare or shared base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. Fetch the PR branch: `git -C <base> fetch origin pull/{pr_number}/head:refs/heads/pr-{pr_number}`
+1. Clone the **upstream** repo as a bare base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
+2. Fetch the PR branch from the **fork**: `git -C <base> fetch https://github.com/{bot_username}/<repo-name>.git pull/{pr_number}/head:refs/heads/pr-{pr_number}`
 3. Create a worktree for this PR: `git -C <base> worktree add --detach <worktree-path> pr-{pr_number}` (using the fetched ref)
-4. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-pr-{number}`.
-5. When you're done (changes pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
+4. Inside the worktree, add the fork as a remote: `git remote add fork https://github.com/{bot_username}/<repo-name>.git`
+5. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-pr-{number}`.
+6. When you're done (changes pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
 
 Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
 
@@ -54,7 +59,7 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 7. If a comment is unclear or you need more information, reply on the PR thread explaining what you need.
 8. Run any existing tests to verify your changes.
 9. Commit with a message that references the feedback, e.g. `address review: fix X as suggested`
-10. Push to the PR branch: `git push origin HEAD`
+10. Push to the PR branch on the **fork** (not upstream): `git push fork HEAD --force-with-lease`
 11. If a review is marked `CHANGES_REQUESTED`, make sure all blocking issues are resolved.
 12. **Unassign yourself from the PR** (all feedback addressed):
     ```
