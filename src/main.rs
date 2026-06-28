@@ -62,6 +62,7 @@ struct State {
     processed_issues: HashMap<String, String>,
     pr_cursors: HashMap<String, PrCursor>,
     processed_mentions: HashMap<String, String>,
+    issue_cursors: HashMap<String, IssueCursor>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +70,12 @@ struct PrCursor {
     last_head_sha: String,
     last_comment_id: u64,
     last_review_id: u64,
+    last_updated: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IssueCursor {
+    last_comment_id: u64,
     last_updated: String,
 }
 
@@ -224,6 +231,25 @@ async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
     serde_json::from_str(&stdout).context("Failed to parse gh pr list")
+}
+
+async fn fetch_bot_issues(config: &Config) -> Result<Vec<GhIssue>> {
+    let author = format!("@{}", config.bot_username);
+    let args: Vec<String> = vec![
+        "issue".into(), "list".into(),
+        "--author".into(), author,
+        "--state".into(), "open".into(),
+        "--search".into(), "is:issue".into(),
+        "--json".into(), "number,title,body,url,createdAt,author".into(),
+        "--limit".into(), "30".into(),
+    ];
+    let stdout = run_cmd(&config.gh_bin, &args).await?;
+    if stdout.is_empty() { return Ok(vec![]); }
+    let mut issues: Vec<GhIssue> = serde_json::from_str(&stdout).context("Failed to parse gh issue list")?;
+    for issue in &mut issues {
+        issue.repo = repo_from_url(&issue.url);
+    }
+    Ok(issues)
 }
 
 async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
@@ -438,7 +464,69 @@ async fn main() -> Result<()> {
             Err(e) => warn!("issue fetch failed: {e:#}"),
         }
 
-        // ── 2. PR feedback (author-gated) ──
+        // ── 2. Issue comments (author-gated) ──
+        match fetch_bot_issues(&config).await {
+            Ok(issues) => {
+                let mut dirty = false;
+
+                for issue in issues {
+                    let key = format!("{}/issues#{}", issue.repo, issue.number);
+                    let cursor = state.issue_cursors.get(&key);
+                    let max_cid = cursor.map(|c| c.last_comment_id).unwrap_or(0);
+
+                    let comments = fetch_pr_issue_comments(&config, &issue.repo, issue.number).await.unwrap_or_default();
+                    let new_comments: Vec<_> = comments.iter()
+                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .cloned().collect();
+
+                    if new_comments.is_empty() {
+                        continue;
+                    }
+
+                    let new_max = new_comments.iter().map(|c| c.id).max().unwrap_or(max_cid).max(max_cid);
+                    state.issue_cursors.insert(key.clone(), IssueCursor {
+                        last_comment_id: new_max,
+                        last_updated: Utc::now().to_rfc3339(),
+                    });
+                    dirty = true;
+
+                    info!("  issue {}/{} — {} new authorized comment(s)", issue.repo, issue.number, new_comments.len());
+
+                    let ctx = serde_json::json!({
+                        "repo": issue.repo,
+                        "number": issue.number,
+                        "title": issue.title,
+                        "author": issue.author.map(|a| a.login),
+                        "type": "Issue",
+                        "url": issue.url,
+                        "body": new_comments.last().map(|c| c.body.as_str()).unwrap_or(""),
+                        "comments": new_comments.iter().map(|c| json!({
+                            "author": c.author.as_ref().map(|a| a.login.as_str()),
+                            "body": c.body,
+                        })).collect::<Vec<_>>(),
+                    });
+
+                    let config = config.clone();
+                    let permit = semaphore.clone().acquire_owned().await.unwrap();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let label = format!("{}-issue-comment-{}", ctx["repo"].as_str().unwrap(), ctx["number"]);
+                        let dir = match ensure_task_dir(&config, &label).await {
+                            Ok(d) => d,
+                            Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                        };
+                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
+                    });
+                }
+
+                if dirty {
+                    save_state(&config.state_file, &state).ok();
+                }
+            }
+            Err(e) => warn!("issue comment fetch failed: {e:#}"),
+        }
+
+        // ── 3. PR feedback (author-gated) ──
         match fetch_open_prs(&config).await {
             Ok(prs) => {
                 let mut dirty = false;
@@ -446,9 +534,6 @@ async fn main() -> Result<()> {
                 for pr in prs {
                     let pr_key = format!("{}/prs#{}", pr.repo, pr.number);
                     let cursor = state.pr_cursors.get(&pr_key);
-                    if cursor.map(|c| c.last_head_sha == pr.head_ref_oid).unwrap_or(false) {
-                        continue;
-                    }
 
                     let ic = fetch_pr_issue_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
                     let rc = fetch_pr_review_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
@@ -527,7 +612,7 @@ async fn main() -> Result<()> {
             Err(e) => warn!("pr fetch failed: {e:#}"),
         }
 
-        // ── 3. Mentions via search API (author-gated) ──
+// ── 3. Mentions via search API (author-gated) ──
         if config.poll_mentions {
             match fetch_mentions(&config).await {
                 Ok(items) => {
