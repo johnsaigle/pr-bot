@@ -13,6 +13,29 @@ use tracing::{debug, error, info, warn};
 
 // ─── Config ───────────────────────────────────────────
 
+#[derive(Debug, Deserialize, Clone, Default)]
+struct Attribution {
+    #[serde(default = "default_attribution_enabled")]
+    enabled: bool,
+    #[serde(default = "default_attribution_text")]
+    text: String,
+}
+
+const fn default_attribution_enabled() -> bool {
+    true
+}
+
+fn default_attribution_text() -> String {
+    "---\n*Authored by {author}. Powered by [PR bot](https://github.com/{author}/pr-bot)*"
+        .into()
+}
+
+impl Attribution {
+    fn signature(&self, authorized_user: &str) -> String {
+        self.text.replace("{author}", authorized_user)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)]
 struct Config {
@@ -39,6 +62,8 @@ struct Config {
     task_timeout_secs: u64,
     #[serde(default = "default_true")]
     poll_mentions: bool,
+    #[serde(default)]
+    attribution: Attribution,
 }
 
 fn default_workflows_dir() -> PathBuf {
@@ -180,6 +205,17 @@ async fn run_cmd<S: AsRef<std::ffi::OsStr>>(cmd: &str, args: &[S]) -> Result<Str
         debug!("stderr '{cmd} {}': {stderr}", args_display.join(" "));
     }
     Ok(stdout)
+}
+
+// ─── Attribution ─────────────────────────────────────
+
+impl Config {
+    fn attribution_context(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enabled": self.attribution.enabled,
+            "signature": self.attribution.signature(&self.authorized_user),
+        })
+    }
 }
 
 // ─── Author gate ──────────────────────────────────────
@@ -739,6 +775,7 @@ async fn main() -> Result<()> {
                         "body": issue.body,
                         "author": issue.author.map(|a| a.login),
                         "bot_username": config.bot_username,
+                        "attribution": config.attribution_context(),
                     });
 
                     let config = config.clone();
@@ -810,6 +847,7 @@ async fn main() -> Result<()> {
                             "author": c.author.as_ref().map(|a| a.login.as_str()),
                             "body": c.body,
                         })).collect::<Vec<_>>(),
+                        "attribution": config.attribution_context(),
                     });
 
                     let config = config.clone();
@@ -905,6 +943,7 @@ async fn main() -> Result<()> {
                             "state": r.state,
                             "body": r.body,
                         })).collect::<Vec<_>>(),
+                        "attribution": config.attribution_context(),
                     });
 
                     info!("[pr-feedback] pr {}/{} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
@@ -995,6 +1034,7 @@ async fn main() -> Result<()> {
                                     "source": "comment",
                                     "url": issue.url,
                                     "bot_username": config.bot_username,
+                                    "attribution": config.attribution_context(),
                                 });
 
                                 let label = format!("{}-auth-issue-{}-comment-{}",
@@ -1062,6 +1102,7 @@ async fn main() -> Result<()> {
                                     "source": "comment",
                                     "url": format!("https://github.com/{}/pull/{}", pr.repo, pr.number),
                                     "bot_username": config.bot_username,
+                                    "attribution": config.attribution_context(),
                                 });
 
                                 let label = format!("{}-auth-pr-{}-comment-{}",
@@ -1117,6 +1158,8 @@ async fn main() -> Result<()> {
                             let body = item.body.as_ref().unwrap();
                             info!("  mention {repo}#{num} ({kind} body)");
 
+                            add_eyes_reaction(&config, &repo, num).await;
+
                             let ctx = serde_json::json!({
                                 "repo": repo,
                                 "number": num,
@@ -1127,6 +1170,7 @@ async fn main() -> Result<()> {
                                 "source": "body",
                                 "url": item.html_url,
                                 "bot_username": config.bot_username,
+                                "attribution": config.attribution_context(),
                             });
 
                             let label = format!("{}-{}-{}-body", repo, kind.to_lowercase(), num);
@@ -1184,6 +1228,7 @@ async fn main() -> Result<()> {
                                     "source": "comment",
                                     "url": item.html_url,
                                     "bot_username": config.bot_username,
+                                    "attribution": config.attribution_context(),
                                 });
 
                                 let label = format!("{}-{}-{}-comment-{}", repo, kind.to_lowercase(), num, comment.id);

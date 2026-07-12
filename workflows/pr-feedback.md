@@ -73,3 +73,4 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 - Do NOT modify files that aren't related to the feedback.
 - Do NOT change the PR title or description unless a comment explicitly asks for it.
 - If you can't resolve a comment without more context, ask rather than guessing.
+- **Attribution signature**: Unless `attribution.enabled` is `false` in the task context, append the `attribution.signature` value from the task context to every comment you post (after the main content, separated by a blank line) and every commit message.

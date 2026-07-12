@@ -87,4 +87,6 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 - Do NOT modify files unrelated to the request.
 - Do NOT change the project's build system, lint config, or CI unless the request explicitly requires it.
 - Do NOT push to the upstream repo. Always push branches to the fork (`git push fork <branch>`). Open cross-fork PRs via `gh pr create --repo {repo} --head {bot_username}:<branch>`.
+- If the mention is on a PR you don't own, prefer replying with analysis over pushing commits unless the user explicitly grants you write access for that PR.
 - If you can't resolve the request without more context, post a comment on the GitHub thread asking for clarification. You are non-interactive — never block waiting for an answer, and never raise a question inside the agent CLI.
+- **Attribution signature**: Unless `attribution.enabled` is `false` in the task context, append the `attribution.signature` value from the task context to every comment you post (after the main content, separated by a blank line) and every commit message.
