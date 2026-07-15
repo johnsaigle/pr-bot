@@ -91,18 +91,6 @@ fn repo_from_url(url: &str) -> String {
     }
 }
 
-fn deserialize_repo_from_head<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::de::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    struct RepoObj {
-        #[serde(rename = "nameWithOwner")]
-        name_with_owner: String,
-    }
-    Ok(RepoObj::deserialize(deserializer)?.name_with_owner)
-}
-
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct GhIssue {
@@ -121,9 +109,10 @@ struct GhIssue {
 struct GhPr {
     number: u64,
     title: String,
+    url: String,
     #[serde(rename = "headRefOid")]
     head_ref_oid: String,
-    #[serde(rename = "headRepository", deserialize_with = "deserialize_repo_from_head")]
+    #[serde(skip)]
     repo: String,
 }
 
@@ -225,12 +214,16 @@ async fn fetch_open_prs(config: &Config) -> Result<Vec<GhPr>> {
         "pr".into(), "list".into(),
         "--author".into(), author,
         "--state".into(), "open".into(),
-        "--json".into(), "number,title,headRefOid,headRepository".into(),
+        "--json".into(), "number,title,headRefOid,url".into(),
         "--limit".into(), "30".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
-    serde_json::from_str(&stdout).context("Failed to parse gh pr list")
+    let mut prs: Vec<GhPr> = serde_json::from_str(&stdout).context("Failed to parse gh pr list")?;
+    for pr in &mut prs {
+        pr.repo = repo_from_url(&pr.url);
+    }
+    Ok(prs)
 }
 
 async fn fetch_bot_issues(config: &Config) -> Result<Vec<GhIssue>> {
@@ -277,12 +270,16 @@ async fn fetch_authorized_prs(config: &Config) -> Result<Vec<GhPr>> {
         "pr".into(), "list".into(),
         "--author".into(), author,
         "--state".into(), "open".into(),
-        "--json".into(), "number,title,headRefOid,headRepository".into(),
+        "--json".into(), "number,title,headRefOid,url".into(),
         "--limit".into(), "30".into(),
     ];
     let stdout = run_cmd(&config.gh_bin, &args).await?;
     if stdout.is_empty() { return Ok(vec![]); }
-    serde_json::from_str(&stdout).context("Failed to parse gh pr list")
+    let mut prs: Vec<GhPr> = serde_json::from_str(&stdout).context("Failed to parse gh pr list")?;
+    for pr in &mut prs {
+        pr.repo = repo_from_url(&pr.url);
+    }
+    Ok(prs)
 }
 
 async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
