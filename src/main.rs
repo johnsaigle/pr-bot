@@ -132,8 +132,8 @@ struct GhPr {
 struct GhComment {
     id: u64,
     body: String,
+    #[serde(rename = "user")]
     author: Option<GhAuthor>,
-    #[serde(rename = "createdAt")]
     created_at: String,
 }
 
@@ -288,9 +288,22 @@ async fn fetch_authorized_prs(config: &Config) -> Result<Vec<GhPr>> {
 async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
     let endpoint = format!("/repos/{repo}/issues/{pr_number}/comments");
     let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
-    let stdout = run_cmd(&config.gh_bin, &args).await?;
-    if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
-    serde_json::from_str(&stdout).context("Failed to parse issue comments")
+    match run_cmd(&config.gh_bin, &args).await {
+        Ok(stdout) => {
+            if stdout == "[]" || stdout.is_empty() { return Ok(vec![]); }
+            match serde_json::from_str::<Vec<GhComment>>(&stdout) {
+                Ok(comments) => Ok(comments),
+                Err(e) => {
+                    warn!("[{repo}#{pr_number}] deserialize comments failed: {e:#}; raw={:.200}", stdout);
+                    Ok(vec![])
+                }
+            }
+        }
+        Err(e) => {
+            warn!("[{repo}#{pr_number}] fetch comments failed: {e:#}");
+            Ok(vec![])
+        }
+    }
 }
 
 async fn fetch_pr_review_comments(config: &Config, repo: &str, pr_number: u64) -> Result<Vec<GhComment>> {
