@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use clap::Parser;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -10,6 +11,17 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
+
+// ─── CLI ──────────────────────────────────────────────
+
+/// Monitors GitHub for assigned issues, mentions, and PR feedback.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// Path to config file
+    #[arg(long, short, env = "PR_BOT_CONFIG")]
+    config: Option<String>,
+}
 
 // ─── Config ───────────────────────────────────────────
 
@@ -459,7 +471,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = std::env::var("PR_BOT_CONFIG").unwrap_or_else(|_| {
+    let cli = Cli::parse();
+
+    let config_path = cli.config.unwrap_or_else(|| {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("pr-bot/config.toml")
