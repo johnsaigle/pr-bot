@@ -26,7 +26,7 @@ const fn default_attribution_enabled() -> bool {
 }
 
 fn default_attribution_text() -> String {
-    "---\n*Authored by {author}. Powered by [PR bot](https://github.com/johnsaigle/pr-bot)*"
+    "---\n*Authored by @{author}. Powered by [PR bot](https://github.com/johnsaigle/pr-bot)*"
         .into()
 }
 
