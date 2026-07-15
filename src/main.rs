@@ -1228,7 +1228,7 @@ async fn main() -> Result<()> {
                 break;
             }
             info!("── health check ──");
-            run_health_checks(&config, &mut state, &semaphore).await;
+            run_health_checks(&config, &mut *state.lock().unwrap(), &semaphore).await;
         }
     }
 }
