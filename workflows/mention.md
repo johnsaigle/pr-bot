@@ -30,14 +30,24 @@ You may read context (parent issue/PR body, prior comments, review state, refere
 
 You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
 
+### Fork setup (required)
+
+The bot account typically does NOT have push access to `{repo}`. You must work via a fork.
+
+1. Ensure a fork exists under the bot account: `gh repo fork {repo} --clone=false` (idempotent — safe to run if the fork already exists).
+2. The fork's full name is `{bot_username}/<repo-name>` (the repo name portion of `{repo}`).
+
 ### Worktree isolation (required)
 
 You must use git worktrees to isolate each task. Never work directly in the main clone.
 
-1. Clone the repo as a bare or shared base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. Decide on a branch strategy based on the thread type (see Workflow below).
-3. Do all your work inside a worktree at `~/.cache/pr-bot/worktrees/{repo}-mention-{number}`.
-4. When you're done, clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
+1. Clone the **upstream** repo as a bare base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
+2. Determine the repo's default branch: `gh repo view {repo} --json defaultBranchRef --jq '.defaultBranchRef.name'`
+3. Fetch the latest from origin: `git -C <base> fetch origin`
+4. Create a worktree for this task: `git -C <base> worktree add --detach <worktree-path> origin/<default-branch>`
+5. Inside the worktree, add the fork as a remote: `git remote add fork https://github.com/{bot_username}/<repo-name>.git`
+6. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-mention-{number}`.
+7. When you're done, clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
 
 Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
 
@@ -53,16 +63,16 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 3. Identify the *specific* comment that mentions you. The mention may be a reply on a longer thread — read the comment you're responding to, not just the top-level body. Quote it back to yourself before acting.
 4. Determine what action is being requested:
    - **Investigate / answer** — reply on the thread with findings; no code changes needed.
-   - **Fix in an existing PR** — check out the PR branch (`git fetch origin pull/{number}/head:refs/heads/pr-{number}`) and push fixes to it.
-   - **Implement a new change** — branch from `main` as `bot/mention-{number}`, make the change, and open a PR referencing the thread (`Refs #{number}`).
+   - **Fix in an existing PR** — treat like the `pr-feedback` workflow. Fetch the PR branch from the **fork** (not upstream) into the worktree, push changes to the fork.
+   - **Implement a new change** — branch from the default branch as `bot/mention-{number}`, make the change, push to the **fork**, and open a cross-fork PR referencing the thread (`Refs #{number}`).
    - **Follow up on a review** — treat like the `pr-feedback` workflow.
 5. **Assign yourself** to the issue or PR so others know you are working on it:
    - For an issue: `gh issue edit {number} --repo {repo} --add-assignee @{bot_username}`
    - For a PR: `gh pr edit {number} --repo {repo} --add-assignee @{bot_username}`
-6. Set up the worktree accordingly.
+6. Set up the worktree as described in the Environment section. Always add the fork remote.
 7. Make the smallest change that satisfies the request. Do NOT refactor or touch unrelated files.
 8. Run any existing tests to verify your changes.
-9. If you opened a PR, push the branch and use `gh pr create` with a body that includes `Refs #{number}` (or `Closes #{number}` if the user explicitly asked to close the thread).
+9. If you opened a PR, push the branch to the **fork** (not upstream) and use `gh pr create` with a body that includes `Refs #{number}` (or `Closes #{number}` if the user explicitly asked to close the thread). Use the cross-fork syntax: `gh pr create --repo {repo} --head {bot_username}:bot/mention-{number} --base <default-branch>`.
 10. Reply on the original thread summarizing what you did and linking any PR. If you only investigated, post your findings as a comment.
 11. **Unassign yourself** from the issue or PR:
     - Issue: `gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}`
@@ -76,5 +86,5 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 - Do NOT close issues or merge PRs unless the user explicitly asks for it.
 - Do NOT modify files unrelated to the request.
 - Do NOT change the project's build system, lint config, or CI unless the request explicitly requires it.
-- If the mention is on a PR you don't own, prefer replying with analysis over pushing commits unless the user explicitly grants you write access for that PR.
+- Do NOT push to the upstream repo. Always push branches to the fork (`git push fork <branch>`). Open cross-fork PRs via `gh pr create --repo {repo} --head {bot_username}:<branch>`.
 - If you can't resolve the request without more context, post a comment on the GitHub thread asking for clarification. You are non-interactive — never block waiting for an answer, and never raise a question inside the agent CLI.
