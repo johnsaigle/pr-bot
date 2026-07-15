@@ -24,6 +24,6 @@ authorized_user = "your-real-username"
 #
 # Disable with: enabled = false
 # Customize the full text:
-#   text = "---\n*Authored by {author}. Powered by [PR bot](https://github.com/{author}/pr-bot)*"
+#   text = "---\n*Authored by {author}. Powered by [PR bot](https://github.com/johnsaigle/pr-bot)*"
 [attribution]
 enabled = true
