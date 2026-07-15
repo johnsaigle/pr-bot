@@ -5,7 +5,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
@@ -65,7 +65,7 @@ struct State {
     issue_cursors: HashMap<String, IssueCursor>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct PrCursor {
     last_head_sha: String,
     last_comment_id: u64,
@@ -386,7 +386,7 @@ async fn launch_opencode(
     context_json: &str,
     workflow_name: &str,
     label: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let prompt = format!(
         "WORKFLOW: {workflow_name}\n\
          WORKFLOWS_DIR: {workflows_dir}\n\n\
@@ -416,16 +416,26 @@ async fn launch_opencode(
         async { child.wait_with_output().await.map(|o| o.status.success()) },
     ).await;
 
-    match result {
-        Ok(Ok(true)) => info!("[{label}] done"),
-        Ok(Ok(false)) => warn!("[{label}] opencode exited non-zero"),
-        Ok(Err(e)) => warn!("[{label}] opencode error: {e:#}"),
+    let success = match result {
+        Ok(Ok(true)) => {
+            info!("[{label}] done");
+            true
+        }
+        Ok(Ok(false)) => {
+            warn!("[{label}] opencode exited non-zero");
+            false
+        }
+        Ok(Err(e)) => {
+            warn!("[{label}] opencode error: {e:#}");
+            false
+        }
         Err(_) => {
             warn!("[{label}] timed out, killing pid {pid}");
             let _ = Command::new("kill").arg(pid.to_string()).output().await;
+            false
         }
-    }
-    Ok(())
+    };
+    Ok(success)
 }
 
 // ─── State helpers ────────────────────────────────────
@@ -473,7 +483,7 @@ async fn main() -> Result<()> {
     info!("pr-bot starting. bot=@{} authorized=@{}",
         config.bot_username, config.authorized_user);
 
-    let mut state = load_state(&config.state_file);
+    let state = Arc::new(Mutex::new(load_state(&config.state_file)));
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
 
     loop {
@@ -483,18 +493,14 @@ async fn main() -> Result<()> {
         match fetch_assigned_issues(&config).await {
             Ok(issues) => {
                 info!("[issues] fetched {} assigned issue(s)", issues.len());
-                let new: Vec<_> = issues.into_iter().filter(|i| {
-                    let key = format!("{}/issues#{}", i.repo, i.number);
-                    let authorized = is_authorized(&i.author, &config);
-                    let processed = state.processed_issues.contains_key(&key);
-                    if !authorized {
-                        info!("[issues] skip {}/{} — author '{}' not authorized", i.repo, i.number,
-                            i.author.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
-                    } else if processed {
-                        info!("[issues] skip {}/{} — already processed", i.repo, i.number);
-                    }
-                    authorized && !processed
-                }).collect();
+                let new: Vec<_> = {
+                    let s = state.lock().unwrap();
+                    issues.into_iter().filter(|i| {
+                        let key = format!("{}/issues#{}", i.repo, i.number);
+                        is_authorized(&i.author, &config)
+                            && !s.processed_issues.contains_key(&key)
+                    }).collect()
+                };
 
                 if !new.is_empty() {
                     info!("[issues] {} new authorized issue(s)", new.len());
@@ -502,7 +508,10 @@ async fn main() -> Result<()> {
 
                 for issue in new {
                     let key = format!("{}/issues#{}", issue.repo, issue.number);
-                    state.processed_issues.insert(key.clone(), Utc::now().to_rfc3339());
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.processed_issues.insert(key.clone(), Utc::now().to_rfc3339());
+                    }
                     info!("  issue {repo}#{num}", repo = issue.repo, num = issue.number);
 
                     add_eyes_reaction(&config, &issue.repo, issue.number).await;
@@ -517,6 +526,8 @@ async fn main() -> Result<()> {
                     });
 
                     let config = config.clone();
+                    let state = Arc::clone(&state);
+                    let state_file = config.state_file.clone();
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -525,11 +536,16 @@ async fn main() -> Result<()> {
                             Ok(d) => d,
                             Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                         };
-                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "new-issue", &label).await;
+                        if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "new-issue", &label).await {
+                            let s = state.lock().unwrap();
+                            save_state(&state_file, &s).ok();
+                        } else {
+                            let mut s = state.lock().unwrap();
+                            s.processed_issues.remove(&key);
+                            save_state(&state_file, &s).ok();
+                        }
                     });
                 }
-
-                save_state(&config.state_file, &state).ok();
             }
             Err(e) => warn!("issue fetch failed: {e:#}"),
         }
@@ -537,12 +553,13 @@ async fn main() -> Result<()> {
         // ── 2. Issue comments (author-gated) ──
         match fetch_bot_issues(&config).await {
             Ok(issues) => {
-                let mut dirty = false;
 
                 for issue in issues {
                     let key = format!("{}/issues#{}", issue.repo, issue.number);
-                    let cursor = state.issue_cursors.get(&key);
-                    let max_cid = cursor.map(|c| c.last_comment_id).unwrap_or(0);
+                    let max_cid = {
+                        let s = state.lock().unwrap();
+                        s.issue_cursors.get(&key).map(|c| c.last_comment_id).unwrap_or(0)
+                    };
 
                     let comments = fetch_pr_issue_comments(&config, &issue.repo, issue.number).await.unwrap_or_default();
                     let new_comments: Vec<_> = comments.iter()
@@ -554,11 +571,14 @@ async fn main() -> Result<()> {
                     }
 
                     let new_max = new_comments.iter().map(|c| c.id).max().unwrap_or(max_cid).max(max_cid);
-                    state.issue_cursors.insert(key.clone(), IssueCursor {
-                        last_comment_id: new_max,
-                        last_updated: Utc::now().to_rfc3339(),
-                    });
-                    dirty = true;
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.issue_cursors.insert(key.clone(), IssueCursor {
+                            last_comment_id: new_max,
+                            last_updated: Utc::now().to_rfc3339(),
+                        });
+                        save_state(&config.state_file, &s).ok();
+                    }
 
                     info!("  issue {}/{} — {} new authorized comment(s)", issue.repo, issue.number, new_comments.len());
 
@@ -589,9 +609,6 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                if dirty {
-                    save_state(&config.state_file, &state).ok();
-                }
             }
             Err(e) => warn!("issue comment fetch failed: {e:#}"),
         }
@@ -600,18 +617,23 @@ async fn main() -> Result<()> {
         match fetch_open_prs(&config).await {
             Ok(prs) => {
                 info!("[pr-feedback] fetched {} open PR(s)", prs.len());
-                let mut dirty = false;
 
                 for pr in prs {
                     let pr_key = format!("{}/prs#{}", pr.repo, pr.number);
-                    let cursor = state.pr_cursors.get(&pr_key);
+                    let cursor = {
+                        let s = state.lock().unwrap();
+                        s.pr_cursors.get(&pr_key).cloned()
+                    };
+                    if cursor.as_ref().map(|c| c.last_head_sha == pr.head_ref_oid).unwrap_or(false) {
+                        continue;
+                    }
 
                     let ic = fetch_pr_issue_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
                     let rc = fetch_pr_review_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
                     let rv = fetch_pr_reviews(&config, &pr.repo, pr.number).await.unwrap_or_default();
 
-                    let max_cid = cursor.map(|c| c.last_comment_id).unwrap_or(0);
-                    let max_rid = cursor.map(|c| c.last_review_id).unwrap_or(0);
+                    let max_cid = cursor.as_ref().map(|c| c.last_comment_id).unwrap_or(0);
+                    let max_rid = cursor.as_ref().map(|c| c.last_review_id).unwrap_or(0);
 
                     let new_ic: Vec<_> = ic.iter()
                         .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
@@ -637,13 +659,17 @@ async fn main() -> Result<()> {
                     let new_max_review = new_rv.iter()
                         .map(|r| r.id).max().unwrap_or(max_rid).max(max_rid);
 
-                    state.pr_cursors.insert(pr_key.clone(), PrCursor {
+                    let new_cursor = PrCursor {
                         last_head_sha: pr.head_ref_oid.clone(),
                         last_comment_id: new_max_comment,
                         last_review_id: new_max_review,
                         last_updated: Utc::now().to_rfc3339(),
-                    });
-                    dirty = true;
+                    };
+                    let old_cursor = cursor;
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.pr_cursors.insert(pr_key.clone(), new_cursor);
+                    }
 
                     let ctx = serde_json::json!({
                         "repo": pr.repo,
@@ -672,6 +698,8 @@ async fn main() -> Result<()> {
                     add_eyes_reaction(&config, &pr.repo, pr.number).await;
 
                     let config = config.clone();
+                    let state = Arc::clone(&state);
+                    let state_file = config.state_file.clone();
                     let permit = semaphore.clone().acquire_owned().await.unwrap();
                     tokio::spawn(async move {
                         let _permit = permit;
@@ -680,12 +708,19 @@ async fn main() -> Result<()> {
                             Ok(d) => d,
                             Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                         };
-                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "pr-feedback", &label).await;
+                        if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "pr-feedback", &label).await {
+                            let s = state.lock().unwrap();
+                            save_state(&state_file, &s).ok();
+                        } else {
+                            let mut s = state.lock().unwrap();
+                            if let Some(prev) = old_cursor {
+                                s.pr_cursors.insert(pr_key.clone(), prev);
+                            } else {
+                                s.pr_cursors.remove(&pr_key);
+                            }
+                            save_state(&state_file, &s).ok();
+                        }
                     });
-                }
-
-                if dirty {
-                    save_state(&config.state_file, &state).ok();
                 }
             }
             Err(e) => warn!("pr fetch failed: {e:#}"),
@@ -701,7 +736,6 @@ async fn main() -> Result<()> {
                 match fetch_authorized_issues(&config).await {
                     Ok(issues) => {
                         let bot = &config.bot_username;
-                        let mut dirty = false;
 
                         info!("[mentions] scanning {} authorized user issue(s) for comment mentions",
                             issues.len());
@@ -711,8 +745,11 @@ async fn main() -> Result<()> {
                                 .await.unwrap_or_default();
                             for comment in &comments {
                                 let ckey = format!("{}#{}#comment-{}", issue.repo, issue.number, comment.id);
-                                if state.processed_mentions.contains_key(&ckey) {
-                                    continue;
+                                {
+                                    let s = state.lock().unwrap();
+                                    if s.processed_mentions.contains_key(&ckey) {
+                                        continue;
+                                    }
                                 }
                                 if !contains_mention(&comment.body, bot) {
                                     continue;
@@ -722,8 +759,11 @@ async fn main() -> Result<()> {
                                         issue.repo, issue.number, comment.id);
                                     continue;
                                 }
-                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
-                                dirty = true;
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                    save_state(&config.state_file, &s).ok();
+                                }
                                 info!("[mentions] {}#{} issue comment {} — mention found",
                                     issue.repo, issue.number, comment.id);
 
@@ -756,10 +796,6 @@ async fn main() -> Result<()> {
                                 });
                             }
                         }
-
-                        if dirty {
-                            save_state(&config.state_file, &state).ok();
-                        }
                     }
                     Err(e) => warn!("auth issues fetch failed: {e:#}"),
                 }
@@ -767,7 +803,6 @@ async fn main() -> Result<()> {
                 match fetch_authorized_prs(&config).await {
                     Ok(prs) => {
                         let bot = &config.bot_username;
-                        let mut dirty = false;
 
                         info!("[mentions] scanning {} authorized user PR(s) for comment mentions",
                             prs.len());
@@ -777,8 +812,11 @@ async fn main() -> Result<()> {
                                 .await.unwrap_or_default();
                             for comment in &comments {
                                 let ckey = format!("{}#{}#comment-{}", pr.repo, pr.number, comment.id);
-                                if state.processed_mentions.contains_key(&ckey) {
-                                    continue;
+                                {
+                                    let s = state.lock().unwrap();
+                                    if s.processed_mentions.contains_key(&ckey) {
+                                        continue;
+                                    }
                                 }
                                 if !contains_mention(&comment.body, bot) {
                                     continue;
@@ -788,8 +826,11 @@ async fn main() -> Result<()> {
                                         pr.repo, pr.number, comment.id);
                                     continue;
                                 }
-                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
-                                dirty = true;
+                                {
+                                    let mut s = state.lock().unwrap();
+                                    s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                    save_state(&config.state_file, &s).ok();
+                                }
                                 info!("[mentions] {}#{} pr comment {} — mention found",
                                     pr.repo, pr.number, comment.id);
 
@@ -822,10 +863,6 @@ async fn main() -> Result<()> {
                                 });
                             }
                         }
-
-                        if dirty {
-                            save_state(&config.state_file, &state).ok();
-                        }
                     }
                     Err(e) => warn!("auth prs fetch failed: {e:#}"),
                 }
@@ -843,70 +880,83 @@ async fn main() -> Result<()> {
                         let kind = if is_pr { "PullRequest" } else { "Issue" };
 
                         let body_key = format!("{repo}#{num}#body");
-                        if !state.processed_mentions.contains_key(&body_key) {
-                            if let Some(ref body) = item.body {
-                                let has_mention = contains_mention(body, bot);
-                                let authorized = is_authorized(&item.user, &config);
-                                if !has_mention {
-                                    info!("[mentions] skip {repo}#{num} body — no @{} mention found", bot);
-                                } else if !authorized {
-                                    info!("[mentions] skip {repo}#{num} body — author '{}' not authorized",
-                                        item.user.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
-                                } else {
-                                    state.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
-                                    info!("[mentions] {repo}#{num} ({kind} body)");
-
-                                    add_eyes_reaction(&config, &repo, num).await;
-
-                                    let ctx = serde_json::json!({
-                                        "repo": repo,
-                                        "number": num,
-                                        "title": item.title,
-                                        "body": body,
-                                        "author": item.user.as_ref().map(|a| a.login.as_str()),
-                                        "type": kind,
-                                        "source": "body",
-                                        "url": item.html_url,
-                                        "bot_username": config.bot_username,
-                                    });
-
-                                    let label = format!("{}-{}-{}-body", repo, kind.to_lowercase(), num);
-                                    let config = config.clone();
-                                    let permit = semaphore.clone().acquire_owned().await.unwrap();
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        let dir = match ensure_task_dir(&config, &label).await {
-                                            Ok(d) => d,
-                                            Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
-                                        };
-                                        let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
-                                    });
-                                }
+                        let should_dispatch_body = {
+                            let s = state.lock().unwrap();
+                            let contained = s.processed_mentions.contains_key(&body_key);
+                            if contained { false } else {
+                                if let Some(ref body) = item.body {
+                                    if contains_mention(body, bot) && is_authorized(&item.user, &config) {
+                                        drop(s);
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
+                                        }
+                                        true
+                                    } else { false }
+                                } else { false }
                             }
+                        };
+
+                        if should_dispatch_body {
+                            let body = item.body.as_ref().unwrap();
+                            info!("  mention {repo}#{num} ({kind} body)");
+
+                            let ctx = serde_json::json!({
+                                "repo": repo,
+                                "number": num,
+                                "title": item.title,
+                                "body": body,
+                                "author": item.user.as_ref().map(|a| a.login.as_str()),
+                                "type": kind,
+                                "source": "body",
+                                "url": item.html_url,
+                                "bot_username": config.bot_username,
+                            });
+
+                            let label = format!("{}-{}-{}-body", repo, kind.to_lowercase(), num);
+                            let config = config.clone();
+                            let state = Arc::clone(&state);
+                            let state_file = config.state_file.clone();
+                            let key = body_key;
+                            let permit = semaphore.clone().acquire_owned().await.unwrap();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let dir = match ensure_task_dir(&config, &label).await {
+                                    Ok(d) => d,
+                                    Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
+                                };
+                                if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await {
+                                    let s = state.lock().unwrap();
+                                    save_state(&state_file, &s).ok();
+                                } else {
+                                    let mut s = state.lock().unwrap();
+                                    s.processed_mentions.remove(&key);
+                                    save_state(&state_file, &s).ok();
+                                }
+                            });
                         }
 
                         let comments = fetch_pr_issue_comments(&config, &repo, num).await.unwrap_or_default();
                         info!("[mentions] {repo}#{num} — {} comment(s) to scan", comments.len());
                         for comment in &comments {
                             let ckey = format!("{repo}#{num}#comment-{}", comment.id);
-                            if state.processed_mentions.contains_key(&ckey) {
-                                continue;
-                            }
-                            let has_mention = contains_mention(&comment.body, bot);
-                            let authorized = is_authorized(&comment.author, &config);
-                            if !has_mention {
-                                continue;
-                            }
-                            if !authorized {
-                                info!("[mentions] skip {repo}#{num} comment {} — author '{}' not authorized",
-                                    comment.id, comment.author.as_ref().map(|a| a.login.as_str()).unwrap_or("none"));
-                                continue;
-                            }
-                            {
-                                state.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
-                                info!("[mentions] {repo}#{num} ({kind} comment {})", comment.id);
+                            let should_dispatch_comment = {
+                                let s = state.lock().unwrap();
+                                let already_processed = s.processed_mentions.contains_key(&ckey);
+                                if already_processed { false } else {
+                                    if contains_mention(&comment.body, bot) && is_authorized(&comment.author, &config) {
+                                        drop(s);
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                        }
+                                        true
+                                    } else { false }
+                                }
+                            };
 
-                                add_eyes_reaction(&config, &repo, num).await;
+                            if should_dispatch_comment {
+                                info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
 
                                 let ctx = serde_json::json!({
                                     "repo": repo,
@@ -922,6 +972,9 @@ async fn main() -> Result<()> {
 
                                 let label = format!("{}-{}-{}-comment-{}", repo, kind.to_lowercase(), num, comment.id);
                                 let config = config.clone();
+                                let state = Arc::clone(&state);
+                                let state_file = config.state_file.clone();
+                                let key = ckey;
                                 let permit = semaphore.clone().acquire_owned().await.unwrap();
                                 tokio::spawn(async move {
                                     let _permit = permit;
@@ -929,13 +982,18 @@ async fn main() -> Result<()> {
                                         Ok(d) => d,
                                         Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                                     };
-                                    let _ = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await;
+                                    if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await {
+                                        let s = state.lock().unwrap();
+                                        save_state(&state_file, &s).ok();
+                                    } else {
+                                        let mut s = state.lock().unwrap();
+                                        s.processed_mentions.remove(&key);
+                                        save_state(&state_file, &s).ok();
+                                    }
                                 });
                             }
                         }
                     }
-
-                    save_state(&config.state_file, &state).ok();
                 }
                 Err(e) => warn!("mentions fetch failed: {e:#}"),
             }
