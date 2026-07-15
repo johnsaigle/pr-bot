@@ -78,3 +78,4 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 - Do NOT modify files outside the scope of the issue unless strictly necessary to make the change work.
 - Do NOT change the project's build system, lint config, or CI unless the issue explicitly requires it.
 - Prefer small, focused changes over large refactors.
+- **Attribution signature**: Unless `attribution.enabled` is `false` in the task context, append the `attribution.signature` value from the task context to every comment you post (after the main content, separated by a blank line) and every commit message.
