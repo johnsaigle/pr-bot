@@ -95,6 +95,14 @@ fn repo_from_url(url: &str) -> String {
     }
 }
 
+fn issue_url(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/issues/{number}")
+}
+
+fn pr_url(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/pull/{number}")
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct GhIssue {
@@ -295,13 +303,13 @@ async fn fetch_pr_issue_comments(config: &Config, repo: &str, pr_number: u64) ->
             match serde_json::from_str::<Vec<GhComment>>(&stdout) {
                 Ok(comments) => Ok(comments),
                 Err(e) => {
-                    warn!("[{repo}#{pr_number}] deserialize comments failed: {e:#}; raw={:.200}", stdout);
+                    warn!("[{}] deserialize comments failed: {e:#}; raw={:.200}", issue_url(repo, pr_number), stdout);
                     Ok(vec![])
                 }
             }
         }
         Err(e) => {
-            warn!("[{repo}#{pr_number}] fetch comments failed: {e:#}");
+            warn!("[{}] fetch comments failed: {e:#}", issue_url(repo, pr_number));
             Ok(vec![])
         }
     }
@@ -359,7 +367,7 @@ fn contains_mention(body: &str, username: &str) -> bool {
 
 // ─── Reactions ────────────────────────────────────────
 
-async fn add_eyes_reaction(config: &Config, repo: &str, number: u64) {
+async fn add_eyes_reaction(config: &Config, repo: &str, number: u64, is_pr: bool) {
     let endpoint = format!("/repos/{repo}/issues/{number}/reactions");
     let args: Vec<String> = vec![
         "api".into(),
@@ -368,9 +376,10 @@ async fn add_eyes_reaction(config: &Config, repo: &str, number: u64) {
         "-f".into(), "content=eyes".into(),
         "--silent".into(),
     ];
+    let url = if is_pr { pr_url(repo, number) } else { issue_url(repo, number) };
     match run_cmd(&config.gh_bin, &args).await {
-        Ok(_) => info!("  👀 {repo}#{number}"),
-        Err(e) => debug!("failed to add 👀 reaction to {repo}#{number}: {e:#}"),
+        Ok(_) => info!("  👀 {url}"),
+        Err(e) => debug!("failed to add 👀 reaction to {url}: {e:#}"),
     }
 }
 
@@ -478,12 +487,12 @@ async fn fetch_pr_mergeable(config: &Config, repo: &str, pr_number: u64) -> Resu
     serde_json::from_str(&stdout).context("Failed to parse pr mergeable")
 }
 
-async fn run_health_checks(config: &Config, state: &mut State, semaphore: &Arc<Semaphore>) {
+async fn run_health_checks(config: &Config, state: &Arc<Mutex<State>>, semaphore: &Arc<Semaphore>) {
     let _ = check_prs_health(config, state, semaphore).await;
     let _ = check_stale_assigned_issues(config, state, semaphore).await;
 }
 
-async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Semaphore>) -> Result<()> {
+async fn check_prs_health(config: &Config, state: &Arc<Mutex<State>>, semaphore: &Arc<Semaphore>) -> Result<()> {
     let prs = match fetch_open_prs(config).await {
         Ok(p) => p,
         Err(e) => { warn!("health: pr fetch failed: {e:#}"); return Ok(()); }
@@ -502,9 +511,17 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
         });
         if has_changes_requested {
             let key = format!("{repo}/prs#{num}-changes-requested");
-            if !state.processed_health.contains_key(&key) {
-                state.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
-                info!("  health: {repo}#{num} CHANGES_REQUESTED review");
+            let should_notify = {
+                let mut s = state.lock().unwrap();
+                if s.processed_health.contains_key(&key) {
+                    false
+                } else {
+                    s.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
+                    true
+                }
+            };
+            if should_notify {
+                info!("  health: {} CHANGES_REQUESTED review", pr_url(repo, num));
 
                 let ctx = json!({
                     "repo": repo,
@@ -540,9 +557,17 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
             });
             if !bot_has_replied {
                 let key = format!("{repo}/prs#{num}-unresolved-{}", last_auth_comment.id);
-                if !state.processed_health.contains_key(&key) {
-                    state.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
-                    info!("  health: {repo}#{num} unresolved comment {}", last_auth_comment.id);
+                let should_notify = {
+                    let mut s = state.lock().unwrap();
+                    if s.processed_health.contains_key(&key) {
+                        false
+                    } else {
+                        s.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
+                        true
+                    }
+                };
+                if should_notify {
+                    info!("  health: {} unresolved comment {}", pr_url(repo, num), last_auth_comment.id);
 
                     let ctx = json!({
                         "repo": repo,
@@ -580,9 +605,17 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
                     || m.mergeable.as_deref() == Some("CONFLICTING");
                 if conflicted {
                     let key = format!("{repo}/prs#{num}-merge-conflict");
-                    if !state.processed_health.contains_key(&key) {
-                        state.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
-                        info!("  health: {repo}#{num} merge conflict (status={:?})", m.merge_state_status);
+                    let should_notify = {
+                        let mut s = state.lock().unwrap();
+                        if s.processed_health.contains_key(&key) {
+                            false
+                        } else {
+                            s.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
+                            true
+                        }
+                    };
+                    if should_notify {
+                        info!("  health: {} merge conflict (status={:?})", pr_url(repo, num), m.merge_state_status);
 
                         let ctx = json!({
                             "repo": repo,
@@ -610,15 +643,15 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
                     }
                 }
             }
-            Err(e) => warn!("health: mergeable check failed for {repo}#{num}: {e:#}"),
+            Err(e) => warn!("health: mergeable check failed for {}: {e:#}", pr_url(repo, num)),
         }
     }
 
-    save_state(&config.state_file, state).ok();
+    save_state(&config.state_file, &state.lock().unwrap()).ok();
     Ok(())
 }
 
-async fn check_stale_assigned_issues(config: &Config, state: &mut State, semaphore: &Arc<Semaphore>) -> Result<()> {
+async fn check_stale_assigned_issues(config: &Config, state: &Arc<Mutex<State>>, semaphore: &Arc<Semaphore>) -> Result<()> {
     let issues = match fetch_assigned_issues(config).await {
         Ok(i) => i,
         Err(e) => { warn!("health: issue fetch failed: {e:#}"); return Ok(()); }
@@ -631,16 +664,22 @@ async fn check_stale_assigned_issues(config: &Config, state: &mut State, semapho
         if !is_authorized(&issue.author, config) {
             continue;
         }
-        // Only check issues that were previously processed (launched) but still open
-        if !state.processed_issues.contains_key(&issue_key) {
-            continue;
-        }
-        if state.processed_health.contains_key(&health_key) {
+        let should_notify = {
+            let mut s = state.lock().unwrap();
+            if !s.processed_issues.contains_key(&issue_key) {
+                false
+            } else if s.processed_health.contains_key(&health_key) {
+                false
+            } else {
+                s.processed_health.insert(health_key.clone(), Utc::now().to_rfc3339());
+                true
+            }
+        };
+        if !should_notify {
             continue;
         }
 
-        state.processed_health.insert(health_key.clone(), Utc::now().to_rfc3339());
-        info!("  health: {}#{} stale assigned issue", issue.repo, issue.number);
+        info!("  health: {} stale assigned issue", issue_url(&issue.repo, issue.number));
 
         let ctx = json!({
             "repo": issue.repo,
@@ -667,7 +706,7 @@ async fn check_stale_assigned_issues(config: &Config, state: &mut State, semapho
         });
     }
 
-    save_state(&config.state_file, state).ok();
+    save_state(&config.state_file, &state.lock().unwrap()).ok();
     Ok(())
 }
 
@@ -728,9 +767,9 @@ async fn main() -> Result<()> {
                         let mut s = state.lock().unwrap();
                         s.processed_issues.insert(key.clone(), Utc::now().to_rfc3339());
                     }
-                    info!("  issue {repo}#{num}", repo = issue.repo, num = issue.number);
+                    info!("  issue {}", issue_url(&issue.repo, issue.number));
 
-                    add_eyes_reaction(&config, &issue.repo, issue.number).await;
+                    add_eyes_reaction(&config, &issue.repo, issue.number, false).await;
 
                     let ctx = serde_json::json!({
                         "repo": issue.repo,
@@ -796,7 +835,7 @@ async fn main() -> Result<()> {
                         save_state(&config.state_file, &s).ok();
                     }
 
-                    info!("  issue {}/{} — {} new authorized comment(s)", issue.repo, issue.number, new_comments.len());
+                    info!("  issue {} — {} new authorized comment(s)", issue_url(&issue.repo, issue.number), new_comments.len());
 
                     let ctx = serde_json::json!({
                         "repo": issue.repo,
@@ -862,8 +901,8 @@ async fn main() -> Result<()> {
                         .cloned().collect();
 
                     if new_ic.is_empty() && new_rc.is_empty() && new_rv.is_empty() {
-                        info!("[pr-feedback] skip {}/{} — {} ic, {} rc, {} rv total; {} ic, {} rc, {} rv after cursor; 0 authorized",
-                            pr.repo, pr.number, ic.len(), rc.len(), rv.len(),
+                        info!("[pr-feedback] skip {} — {} ic, {} rc, {} rv total; {} ic, {} rc, {} rv after cursor; 0 authorized",
+                            pr_url(&pr.repo, pr.number), ic.len(), rc.len(), rv.len(),
                             ic.iter().filter(|c| c.id > max_cid).count(),
                             rc.iter().filter(|c| c.id > max_cid).count(),
                             rv.iter().filter(|r| r.id > max_rid).count());
@@ -907,11 +946,11 @@ async fn main() -> Result<()> {
                         })).collect::<Vec<_>>(),
                     });
 
-                    info!("[pr-feedback] pr {}/{} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
-                        pr.repo, pr.number, new_ic.len() + new_rc.len() + new_rv.len(),
+                    info!("[pr-feedback] pr {} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
+                        pr_url(&pr.repo, pr.number), new_ic.len() + new_rc.len() + new_rv.len(),
                         new_ic.len(), new_rc.len(), new_rv.len());
 
-                    add_eyes_reaction(&config, &pr.repo, pr.number).await;
+                                add_eyes_reaction(&config, &pr.repo, pr.number, true).await;
 
                     let config = config.clone();
                     let state = Arc::clone(&state);
@@ -971,8 +1010,8 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                                 if !is_authorized(&comment.author, &config) {
-                                    info!("[mentions] skip {}#{} comment {} — author not authorized",
-                                        issue.repo, issue.number, comment.id);
+                                    info!("[mentions] skip {} comment {} — author not authorized",
+                                        issue_url(&issue.repo, issue.number), comment.id);
                                     continue;
                                 }
                                 {
@@ -980,10 +1019,10 @@ async fn main() -> Result<()> {
                                     s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
                                     save_state(&config.state_file, &s).ok();
                                 }
-                                info!("[mentions] {}#{} issue comment {} — mention found",
-                                    issue.repo, issue.number, comment.id);
+                                info!("[mentions] {} issue comment {} — mention found",
+                                    issue_url(&issue.repo, issue.number), comment.id);
 
-                                add_eyes_reaction(&config, &issue.repo, issue.number).await;
+                                add_eyes_reaction(&config, &issue.repo, issue.number, false).await;
 
                                 let ctx = serde_json::json!({
                                     "repo": issue.repo,
@@ -1038,8 +1077,8 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                                 if !is_authorized(&comment.author, &config) {
-                                    info!("[mentions] skip {}#{} pr comment {} — author not authorized",
-                                        pr.repo, pr.number, comment.id);
+                                    info!("[mentions] skip {} pr comment {} — author not authorized",
+                                        pr_url(&pr.repo, pr.number), comment.id);
                                     continue;
                                 }
                                 {
@@ -1047,10 +1086,10 @@ async fn main() -> Result<()> {
                                     s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
                                     save_state(&config.state_file, &s).ok();
                                 }
-                                info!("[mentions] {}#{} pr comment {} — mention found",
-                                    pr.repo, pr.number, comment.id);
+                                info!("[mentions] {} pr comment {} — mention found",
+                                    pr_url(&pr.repo, pr.number), comment.id);
 
-                                add_eyes_reaction(&config, &pr.repo, pr.number).await;
+                    add_eyes_reaction(&config, &pr.repo, pr.number, true).await;
 
                                 let ctx = serde_json::json!({
                                     "repo": pr.repo,
@@ -1115,7 +1154,7 @@ async fn main() -> Result<()> {
 
                         if should_dispatch_body {
                             let body = item.body.as_ref().unwrap();
-                            info!("  mention {repo}#{num} ({kind} body)");
+                            info!("  mention {} ({kind} body)", item.html_url);
 
                             let ctx = serde_json::json!({
                                 "repo": repo,
@@ -1153,7 +1192,7 @@ async fn main() -> Result<()> {
                         }
 
                         let comments = fetch_pr_issue_comments(&config, &repo, num).await.unwrap_or_default();
-                        info!("[mentions] {repo}#{num} — {} comment(s) to scan", comments.len());
+                        info!("[mentions] {} — {} comment(s) to scan", item.html_url, comments.len());
                         for comment in &comments {
                             let ckey = format!("{repo}#{num}#comment-{}", comment.id);
                             let should_dispatch_comment = {
@@ -1172,7 +1211,7 @@ async fn main() -> Result<()> {
                             };
 
                             if should_dispatch_comment {
-                                info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
+                                info!("  mention {} ({kind} comment {})", item.html_url, comment.id);
 
                                 let ctx = serde_json::json!({
                                     "repo": repo,
@@ -1228,7 +1267,7 @@ async fn main() -> Result<()> {
                 break;
             }
             info!("── health check ──");
-            run_health_checks(&config, &mut state, &semaphore).await;
+            run_health_checks(&config, &state, &semaphore).await;
         }
     }
 }
