@@ -69,6 +69,8 @@ struct Config {
     poll_interval_secs: u64,
     #[serde(default = "default_health_check_interval")]
     health_check_interval_secs: u64,
+    #[serde(default = "default_health_check_grace_period")]
+    health_check_grace_period_secs: u64,
     model: Option<String>,
     #[serde(default = "default_task_timeout")]
     task_timeout_secs: u64,
@@ -92,6 +94,7 @@ fn default_opencode() -> PathBuf { PathBuf::from("opencode") }
 fn default_gh() -> String { "gh".into() }
 const fn default_poll_interval() -> u64 { 300 }
 const fn default_health_check_interval() -> u64 { 60 }
+const fn default_health_check_grace_period() -> u64 { 300 }
 const fn default_task_timeout() -> u64 { 1800 }
 fn default_true() -> bool { true }
 
@@ -430,6 +433,18 @@ async fn ensure_task_dir(config: &Config, label: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn bot_commented_recently(comments: &[GhComment], bot_username: &str, grace_period_secs: u64) -> bool {
+    let now = Utc::now();
+    comments.iter().any(|c| {
+        c.author.as_ref().is_some_and(|a| a.login == bot_username)
+            && c.created_at.parse::<chrono::DateTime<Utc>>().ok()
+                .is_some_and(|ts| {
+                    let diff = now - ts;
+                    diff.num_seconds().unsigned_abs() < grace_period_secs
+                })
+    })
+}
+
 // ─── Launch opencode ──────────────────────────────────
 
 async fn launch_opencode(
@@ -587,6 +602,10 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
                     && c.author.as_ref().is_some_and(|a| a.login == config.bot_username)
             });
             if !bot_has_replied {
+                if bot_commented_recently(&comments, &config.bot_username, config.health_check_grace_period_secs) {
+                    debug!("  health: {repo}#{num} — bot recently commented, skipping unresolved check");
+                    continue;
+                }
                 let key = format!("{repo}/prs#{num}-unresolved-{}", last_auth_comment.id);
                 if !state.processed_health.contains_key(&key) {
                     state.processed_health.insert(key.clone(), Utc::now().to_rfc3339());
@@ -684,6 +703,15 @@ async fn check_stale_assigned_issues(config: &Config, state: &mut State, semapho
             continue;
         }
         if state.processed_health.contains_key(&health_key) {
+            continue;
+        }
+
+        let comments = fetch_pr_issue_comments(config, &issue.repo, issue.number)
+            .await
+            .unwrap_or_default();
+        if bot_commented_recently(&comments, &config.bot_username, config.health_check_grace_period_secs) {
+            debug!("  health: {}/{}#{} — bot recently commented, skipping stale check",
+                issue.repo, issue.number, issue.number);
             continue;
         }
 
