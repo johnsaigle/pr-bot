@@ -470,9 +470,8 @@ async fn main() -> Result<()> {
     let config: Config = {
         let data = std::fs::read_to_string(&config_path).context(format!(
             "Config not found at {config_path}\n\n\
-             To get started, create a config file:\n  \
-             mkdir -p ~/.config/pr-bot\n  \
-             cp config.example.toml ~/.config/pr-bot/config.toml\n  \
+             To get started:\n  \
+             make install\n  \
              # Then edit ~/.config/pr-bot/config.toml with your details\n\n\
              Alternatively, set the PR_BOT_CONFIG environment variable to \
              point to a custom config file location.",
