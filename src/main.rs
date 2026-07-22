@@ -1,3 +1,6 @@
+#![allow(dead_code)]
+#![allow(clippy::too_many_lines, clippy::similar_names)]
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use chrono::Utc;
@@ -93,7 +96,7 @@ fn default_gh() -> String { "gh".into() }
 const fn default_poll_interval() -> u64 { 300 }
 const fn default_health_check_interval() -> u64 { 60 }
 const fn default_task_timeout() -> u64 { 1800 }
-fn default_true() -> bool { true }
+const fn default_true() -> bool { true }
 
 // ─── State ────────────────────────────────────────────
 
@@ -107,6 +110,7 @@ struct State {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[allow(clippy::struct_field_names)]
 struct PrCursor {
     last_head_sha: String,
     last_comment_id: u64,
@@ -194,7 +198,7 @@ struct GhSearchItem {
 
 // ─── Helpers ──────────────────────────────────────────
 
-async fn run_cmd<S: AsRef<std::ffi::OsStr>>(cmd: &str, args: &[S]) -> Result<String> {
+async fn run_cmd<S: AsRef<std::ffi::OsStr> + Sync>(cmd: &str, args: &[S]) -> Result<String> {
     let args_display: Vec<&str> = args.iter().filter_map(|a| a.as_ref().to_str()).collect();
     let output = Command::new(cmd)
         .args(args)
@@ -232,11 +236,8 @@ impl Config {
 
 // ─── Author gate ──────────────────────────────────────
 
-fn is_authorized(author: &Option<GhAuthor>, config: &Config) -> bool {
-    author
-        .as_ref()
-        .map(|a| a.login == config.authorized_user)
-        .unwrap_or(false)
+fn is_authorized(author: Option<&GhAuthor>, config: &Config) -> bool {
+    author.is_some_and(|a| a.login == config.authorized_user)
 }
 
 // ─── GitHub polling ───────────────────────────────────
@@ -376,7 +377,7 @@ async fn fetch_mentions(config: &Config) -> Result<Vec<GhSearchItem>> {
     let args: Vec<String> = vec![
         "api".into(), "/search/issues".into(),
         "--method".into(), "GET".into(),
-        "-f".into(), format!("q={query}").into(),
+        "-f".into(), format!("q={query}"),
         "-f".into(), "sort=updated".into(),
         "-f".into(), "order=desc".into(),
         "-f".into(), "per_page=30".into(),
@@ -393,10 +394,8 @@ fn contains_mention(body: &str, username: &str) -> bool {
     while let Some(pos) = body[start..].find(&needle) {
         let abs = start + pos;
         let after = abs + needle.len();
-        let boundary = match body.get(after..).and_then(|s| s.chars().next()) {
-            None => true,
-            Some(c) => !c.is_alphanumeric() && c != '-' && c != '_',
-        };
+        let boundary = body.get(after..).and_then(|s| s.chars().next())
+            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
         if boundary {
             return true;
         }
@@ -546,7 +545,7 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
 
         // ── changes-requested ──
         let has_changes_requested = reviews.iter().any(|r| {
-            r.state == "CHANGES_REQUESTED" && is_authorized(&r.user, config)
+            r.state == "CHANGES_REQUESTED" && is_authorized(r.user.as_ref(), config)
         });
         if has_changes_requested {
             let key = format!("{repo}/prs#{num}-changes-requested");
@@ -579,7 +578,7 @@ async fn check_prs_health(config: &Config, state: &mut State, semaphore: &Arc<Se
 
         // ── unresolved-comment ──
         let auth_comments: Vec<_> = comments.iter()
-            .filter(|c| is_authorized(&c.author, config))
+            .filter(|c| is_authorized(c.author.as_ref(), config))
             .collect();
         if let Some(last_auth_comment) = auth_comments.last() {
             let bot_has_replied = comments.iter().any(|c| {
@@ -676,7 +675,7 @@ async fn check_stale_assigned_issues(config: &Config, state: &mut State, semapho
         let issue_key = format!("{}/issues#{}", issue.repo, issue.number);
         let health_key = format!("{}/issues#{}", issue.repo, issue.number);
 
-        if !is_authorized(&issue.author, config) {
+        if !is_authorized(issue.author.as_ref(), config) {
             continue;
         }
         // Only check issues that were previously processed (launched) but still open
@@ -722,6 +721,7 @@ async fn check_stale_assigned_issues(config: &Config, state: &mut State, semapho
 // ─── Main loop ────────────────────────────────────────
 
 #[tokio::main]
+#[allow(clippy::significant_drop_tightening, clippy::await_holding_lock)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -763,7 +763,7 @@ async fn main() -> Result<()> {
                     let s = state.lock().unwrap();
                     issues.into_iter().filter(|i| {
                         let key = format!("{}/issues#{}", i.repo, i.number);
-                        is_authorized(&i.author, &config)
+                        is_authorized(i.author.as_ref(), &config)
                             && !s.processed_issues.contains_key(&key)
                     }).collect()
                 };
@@ -803,7 +803,7 @@ async fn main() -> Result<()> {
                             Ok(d) => d,
                             Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                         };
-                        if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "new-issue", &label).await {
+                        if matches!(launch_opencode(&config, &dir, &ctx.to_string(), "new-issue", &label).await, Ok(true)) {
                             let s = state.lock().unwrap();
                             save_state(&state_file, &s).ok();
                         } else {
@@ -825,12 +825,12 @@ async fn main() -> Result<()> {
                     let key = format!("{}/issues#{}", issue.repo, issue.number);
                     let max_cid = {
                         let s = state.lock().unwrap();
-                        s.issue_cursors.get(&key).map(|c| c.last_comment_id).unwrap_or(0)
+                        s.issue_cursors.get(&key).map_or(0, |c| c.last_comment_id)
                     };
 
                     let comments = fetch_pr_issue_comments(&config, &issue.repo, issue.number).await.unwrap_or_default();
                     let new_comments: Vec<_> = comments.iter()
-                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .filter(|c| c.id > max_cid && is_authorized(c.author.as_ref(), &config))
                         .cloned().collect();
 
                     if new_comments.is_empty() {
@@ -856,7 +856,7 @@ async fn main() -> Result<()> {
                         "author": issue.author.map(|a| a.login),
                         "type": "Issue",
                         "url": issue.url,
-                        "body": new_comments.last().map(|c| c.body.as_str()).unwrap_or(""),
+                        "body": new_comments.last().map_or("", |c| c.body.as_str()),
                         "comments": new_comments.iter().map(|c| json!({
                             "author": c.author.as_ref().map(|a| a.login.as_str()),
                             "body": c.body,
@@ -892,7 +892,7 @@ async fn main() -> Result<()> {
                         let s = state.lock().unwrap();
                         s.pr_cursors.get(&pr_key).cloned()
                     };
-                    if cursor.as_ref().map(|c| c.last_head_sha == pr.head_ref_oid).unwrap_or(false) {
+                    if cursor.as_ref().is_some_and(|c| c.last_head_sha == pr.head_ref_oid) {
                         continue;
                     }
 
@@ -900,17 +900,17 @@ async fn main() -> Result<()> {
                     let rc = fetch_pr_review_comments(&config, &pr.repo, pr.number).await.unwrap_or_default();
                     let rv = fetch_pr_reviews(&config, &pr.repo, pr.number).await.unwrap_or_default();
 
-                    let max_cid = cursor.as_ref().map(|c| c.last_comment_id).unwrap_or(0);
-                    let max_rid = cursor.as_ref().map(|c| c.last_review_id).unwrap_or(0);
+                    let max_cid = cursor.as_ref().map_or(0, |c| c.last_comment_id);
+                    let max_rid = cursor.as_ref().map_or(0, |c| c.last_review_id);
 
                     let new_ic: Vec<_> = ic.iter()
-                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .filter(|c| c.id > max_cid && is_authorized(c.author.as_ref(), &config))
                         .cloned().collect();
                     let new_rc: Vec<_> = rc.iter()
-                        .filter(|c| c.id > max_cid && is_authorized(&c.author, &config))
+                        .filter(|c| c.id > max_cid && is_authorized(c.author.as_ref(), &config))
                         .cloned().collect();
                     let new_rv: Vec<_> = rv.iter()
-                        .filter(|r| r.id > max_rid && is_authorized(&r.user, &config))
+                        .filter(|r| r.id > max_rid && is_authorized(r.user.as_ref(), &config))
                         .cloned().collect();
 
                     if new_ic.is_empty() && new_rc.is_empty() && new_rv.is_empty() {
@@ -977,7 +977,7 @@ async fn main() -> Result<()> {
                             Ok(d) => d,
                             Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                         };
-                        if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "pr-feedback", &label).await {
+                        if matches!(launch_opencode(&config, &dir, &ctx.to_string(), "pr-feedback", &label).await, Ok(true)) {
                             let s = state.lock().unwrap();
                             save_state(&state_file, &s).ok();
                         } else {
@@ -1023,7 +1023,7 @@ async fn main() -> Result<()> {
                                 if !contains_mention(&comment.body, bot) {
                                     continue;
                                 }
-                                if !is_authorized(&comment.author, &config) {
+                                if !is_authorized(comment.author.as_ref(), &config) {
                                     info!("[mentions] skip {}#{} comment {} — author not authorized",
                                         issue.repo, issue.number, comment.id);
                                     continue;
@@ -1091,7 +1091,7 @@ async fn main() -> Result<()> {
                                 if !contains_mention(&comment.body, bot) {
                                     continue;
                                 }
-                                if !is_authorized(&comment.author, &config) {
+                                if !is_authorized(comment.author.as_ref(), &config) {
                                     info!("[mentions] skip {}#{} pr comment {} — author not authorized",
                                         pr.repo, pr.number, comment.id);
                                     continue;
@@ -1154,18 +1154,16 @@ async fn main() -> Result<()> {
                         let should_dispatch_body = {
                             let s = state.lock().unwrap();
                             let contained = s.processed_mentions.contains_key(&body_key);
-                            if contained { false } else {
-                                if let Some(ref body) = item.body {
-                                    if contains_mention(body, bot) && is_authorized(&item.user, &config) {
-                                        drop(s);
-                                        {
-                                            let mut s = state.lock().unwrap();
-                                            s.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
-                                        }
-                                        true
-                                    } else { false }
+                            if contained { false } else if let Some(ref body) = item.body {
+                                if contains_mention(body, bot) && is_authorized(item.user.as_ref(), &config) {
+                                    drop(s);
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.processed_mentions.insert(body_key.clone(), Utc::now().to_rfc3339());
+                                    }
+                                    true
                                 } else { false }
-                            }
+                            } else { false }
                         };
 
                         if should_dispatch_body {
@@ -1199,7 +1197,7 @@ async fn main() -> Result<()> {
                                     Ok(d) => d,
                                     Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                                 };
-                                if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await {
+                                if matches!(launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await, Ok(true)) {
                                     let s = state.lock().unwrap();
                                     save_state(&state_file, &s).ok();
                                 } else {
@@ -1217,16 +1215,14 @@ async fn main() -> Result<()> {
                             let should_dispatch_comment = {
                                 let s = state.lock().unwrap();
                                 let already_processed = s.processed_mentions.contains_key(&ckey);
-                                if already_processed { false } else {
-                                    if contains_mention(&comment.body, bot) && is_authorized(&comment.author, &config) {
-                                        drop(s);
-                                        {
-                                            let mut s = state.lock().unwrap();
-                                            s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
-                                        }
-                                        true
-                                    } else { false }
-                                }
+                                if already_processed { false } else if contains_mention(&comment.body, bot) && is_authorized(comment.author.as_ref(), &config) {
+                                    drop(s);
+                                    {
+                                        let mut s = state.lock().unwrap();
+                                        s.processed_mentions.insert(ckey.clone(), Utc::now().to_rfc3339());
+                                    }
+                                    true
+                                } else { false }
                             };
 
                             if should_dispatch_comment {
@@ -1257,7 +1253,7 @@ async fn main() -> Result<()> {
                                         Ok(d) => d,
                                         Err(e) => { error!("[{label}] task dir failed: {e:#}"); return; }
                                     };
-                                    if let Ok(true) = launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await {
+                                    if matches!(launch_opencode(&config, &dir, &ctx.to_string(), "mention", &label).await, Ok(true)) {
                                         let s = state.lock().unwrap();
                                         save_state(&state_file, &s).ok();
                                     } else {
@@ -1287,7 +1283,7 @@ async fn main() -> Result<()> {
                 break;
             }
             info!("── health check ──");
-            run_health_checks(&config, &mut *state.lock().unwrap(), &semaphore).await;
+            run_health_checks(&config, &mut state.lock().unwrap(), &semaphore).await;
         }
     }
 }
