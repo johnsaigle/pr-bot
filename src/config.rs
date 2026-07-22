@@ -56,6 +56,8 @@ pub(crate) struct Config {
     pub(crate) poll_interval_secs: u64,
     #[serde(default = "default_health_check_interval")]
     pub(crate) health_check_interval_secs: u64,
+    #[serde(default = "default_health_check_grace_period")]
+    pub(crate) health_check_grace_period_secs: u64,
     pub(crate) model: Option<String>,
     #[serde(default = "default_task_timeout")]
     pub(crate) task_timeout_secs: u64,
@@ -95,6 +97,9 @@ const fn default_poll_interval() -> u64 {
 const fn default_health_check_interval() -> u64 {
     60
 }
+const fn default_health_check_grace_period() -> u64 {
+    14 * 24 * 60 * 60
+}
 const fn default_task_timeout() -> u64 {
     1800
 }
@@ -108,5 +113,23 @@ impl Config {
             "enabled": self.attribution.enabled,
             "signature": self.attribution.signature(&self.authorized_user),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn health_check_grace_period_defaults_to_fourteen_days() {
+        let config: Config = toml::from_str(
+            r#"
+                bot_username = "bot"
+                authorized_user = "human"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.health_check_grace_period_secs, 14 * 24 * 60 * 60);
     }
 }

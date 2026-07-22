@@ -10,8 +10,8 @@ use crate::config::Config;
 use crate::github::{
     add_eyes_reaction, contains_mention, fetch_assigned_issues, fetch_authorized_issues,
     fetch_authorized_prs, fetch_bot_issues, fetch_mentions, fetch_open_prs,
-    fetch_pr_issue_comments, fetch_pr_review_comments, fetch_pr_reviews, is_authorized,
-    repo_from_url,
+    fetch_pr_issue_comments, fetch_pr_review_comments, fetch_pr_reviews, is_authorized, issue_url,
+    pr_url, repo_from_url,
 };
 use crate::health::run_health_checks;
 use crate::state::{IssueCursor, PrCursor, load_state, save_state};
@@ -55,13 +55,9 @@ pub(crate) async fn run(config: Config) {
                         s.processed_issues
                             .insert(key.clone(), Utc::now().to_rfc3339());
                     }
-                    info!(
-                        "  issue {repo}#{num}",
-                        repo = issue.repo,
-                        num = issue.number
-                    );
+                    info!("  issue {}", issue_url(&issue.repo, issue.number));
 
-                    add_eyes_reaction(&config, &issue.repo, issue.number).await;
+                    add_eyes_reaction(&config, &issue.repo, issue.number, &issue.url).await;
 
                     let ctx = serde_json::json!({
                         "repo": issue.repo,
@@ -119,9 +115,10 @@ pub(crate) async fn run(config: Config) {
                         s.issue_cursors.get(&key).map_or(0, |c| c.last_comment_id)
                     };
 
-                    let comments = fetch_pr_issue_comments(&config, &issue.repo, issue.number)
-                        .await
-                        .unwrap_or_default();
+                    let comments =
+                        fetch_pr_issue_comments(&config, &issue.repo, issue.number, &issue.url)
+                            .await
+                            .unwrap_or_default();
                     let new_comments: Vec<_> = comments
                         .iter()
                         .filter(|c| c.id > max_cid && is_authorized(c.author.as_ref(), &config))
@@ -151,9 +148,8 @@ pub(crate) async fn run(config: Config) {
                     }
 
                     info!(
-                        "  issue {}/{} — {} new authorized comment(s)",
-                        issue.repo,
-                        issue.number,
+                        "  issue {} — {} new authorized comment(s)",
+                        issue_url(&issue.repo, issue.number),
                         new_comments.len()
                     );
 
@@ -214,7 +210,7 @@ pub(crate) async fn run(config: Config) {
                         continue;
                     }
 
-                    let ic = fetch_pr_issue_comments(&config, &pr.repo, pr.number)
+                    let ic = fetch_pr_issue_comments(&config, &pr.repo, pr.number, &pr.url)
                         .await
                         .unwrap_or_default();
                     let rc = fetch_pr_review_comments(&config, &pr.repo, pr.number)
@@ -245,9 +241,8 @@ pub(crate) async fn run(config: Config) {
 
                     if new_ic.is_empty() && new_rc.is_empty() && new_rv.is_empty() {
                         info!(
-                            "[pr-feedback] skip {}/{} — {} ic, {} rc, {} rv total; {} ic, {} rc, {} rv after cursor; 0 authorized",
-                            pr.repo,
-                            pr.number,
+                            "[pr-feedback] skip {} — {} ic, {} rc, {} rv total; {} ic, {} rc, {} rv after cursor; 0 authorized",
+                            pr_url(&pr.repo, pr.number),
                             ic.len(),
                             rc.len(),
                             rv.len(),
@@ -306,16 +301,15 @@ pub(crate) async fn run(config: Config) {
                     });
 
                     info!(
-                        "[pr-feedback] pr {}/{} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
-                        pr.repo,
-                        pr.number,
+                        "[pr-feedback] pr {} — {} new authorized comment(s) ({} ic, {} rc, {} rv)",
+                        pr_url(&pr.repo, pr.number),
                         new_ic.len() + new_rc.len() + new_rv.len(),
                         new_ic.len(),
                         new_rc.len(),
                         new_rv.len()
                     );
 
-                    add_eyes_reaction(&config, &pr.repo, pr.number).await;
+                    add_eyes_reaction(&config, &pr.repo, pr.number, &pr.url).await;
 
                     let config = config.clone();
                     let state = Arc::clone(&state);
@@ -371,10 +365,14 @@ pub(crate) async fn run(config: Config) {
                         );
 
                         for issue in &issues {
-                            let comments =
-                                fetch_pr_issue_comments(&config, &issue.repo, issue.number)
-                                    .await
-                                    .unwrap_or_default();
+                            let comments = fetch_pr_issue_comments(
+                                &config,
+                                &issue.repo,
+                                issue.number,
+                                &issue.url,
+                            )
+                            .await
+                            .unwrap_or_default();
                             for comment in &comments {
                                 let ckey = format!(
                                     "{}#{}#comment-{}",
@@ -391,8 +389,9 @@ pub(crate) async fn run(config: Config) {
                                 }
                                 if !is_authorized(comment.author.as_ref(), &config) {
                                     info!(
-                                        "[mentions] skip {}#{} comment {} — author not authorized",
-                                        issue.repo, issue.number, comment.id
+                                        "[mentions] skip {} comment {} — author not authorized",
+                                        issue_url(&issue.repo, issue.number),
+                                        comment.id
                                     );
                                     continue;
                                 }
@@ -403,11 +402,13 @@ pub(crate) async fn run(config: Config) {
                                     save_state(&config.state_file, &s).ok();
                                 }
                                 info!(
-                                    "[mentions] {}#{} issue comment {} — mention found",
-                                    issue.repo, issue.number, comment.id
+                                    "[mentions] {} comment {} — mention found",
+                                    issue_url(&issue.repo, issue.number),
+                                    comment.id
                                 );
 
-                                add_eyes_reaction(&config, &issue.repo, issue.number).await;
+                                add_eyes_reaction(&config, &issue.repo, issue.number, &issue.url)
+                                    .await;
 
                                 let ctx = serde_json::json!({
                                     "repo": issue.repo,
@@ -462,9 +463,10 @@ pub(crate) async fn run(config: Config) {
                         );
 
                         for pr in &prs {
-                            let comments = fetch_pr_issue_comments(&config, &pr.repo, pr.number)
-                                .await
-                                .unwrap_or_default();
+                            let comments =
+                                fetch_pr_issue_comments(&config, &pr.repo, pr.number, &pr.url)
+                                    .await
+                                    .unwrap_or_default();
                             for comment in &comments {
                                 let ckey =
                                     format!("{}#{}#comment-{}", pr.repo, pr.number, comment.id);
@@ -479,8 +481,9 @@ pub(crate) async fn run(config: Config) {
                                 }
                                 if !is_authorized(comment.author.as_ref(), &config) {
                                     info!(
-                                        "[mentions] skip {}#{} pr comment {} — author not authorized",
-                                        pr.repo, pr.number, comment.id
+                                        "[mentions] skip {} comment {} — author not authorized",
+                                        pr_url(&pr.repo, pr.number),
+                                        comment.id
                                     );
                                     continue;
                                 }
@@ -491,11 +494,12 @@ pub(crate) async fn run(config: Config) {
                                     save_state(&config.state_file, &s).ok();
                                 }
                                 info!(
-                                    "[mentions] {}#{} pr comment {} — mention found",
-                                    pr.repo, pr.number, comment.id
+                                    "[mentions] {} comment {} — mention found",
+                                    pr_url(&pr.repo, pr.number),
+                                    comment.id
                                 );
 
-                                add_eyes_reaction(&config, &pr.repo, pr.number).await;
+                                add_eyes_reaction(&config, &pr.repo, pr.number, &pr.url).await;
 
                                 let ctx = serde_json::json!({
                                     "repo": pr.repo,
@@ -579,9 +583,14 @@ pub(crate) async fn run(config: Config) {
 
                         if should_dispatch_body {
                             let body = item.body.as_ref().unwrap();
-                            info!("  mention {repo}#{num} ({kind} body)");
+                            let url = if is_pr {
+                                pr_url(&repo, num)
+                            } else {
+                                issue_url(&repo, num)
+                            };
+                            info!("  mention {url} ({kind} body)");
 
-                            add_eyes_reaction(&config, &repo, num).await;
+                            add_eyes_reaction(&config, &repo, num, &item.html_url).await;
 
                             let ctx = serde_json::json!({
                                 "repo": repo,
@@ -632,11 +641,16 @@ pub(crate) async fn run(config: Config) {
                             });
                         }
 
-                        let comments = fetch_pr_issue_comments(&config, &repo, num)
+                        let comments = fetch_pr_issue_comments(&config, &repo, num, &item.html_url)
                             .await
                             .unwrap_or_default();
                         info!(
-                            "[mentions] {repo}#{num} — {} comment(s) to scan",
+                            "[mentions] {} — {} comment(s) to scan",
+                            if is_pr {
+                                pr_url(&repo, num)
+                            } else {
+                                issue_url(&repo, num)
+                            },
                             comments.len()
                         );
                         for comment in &comments {
@@ -662,7 +676,15 @@ pub(crate) async fn run(config: Config) {
                             };
 
                             if should_dispatch_comment {
-                                info!("  mention {repo}#{num} ({kind} comment {})", comment.id);
+                                info!(
+                                    "  mention {} ({kind} comment {})",
+                                    if is_pr {
+                                        pr_url(&repo, num)
+                                    } else {
+                                        issue_url(&repo, num)
+                                    },
+                                    comment.id
+                                );
 
                                 let ctx = serde_json::json!({
                                     "repo": repo,

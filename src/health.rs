@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use crate::agent::{ensure_task_dir, launch_opencode};
 use crate::config::Config;
 use crate::github::{
     fetch_assigned_issues, fetch_open_prs, fetch_pr_issue_comments, fetch_pr_reviews,
-    is_authorized, run_cmd,
+    is_authorized, issue_url, pr_url, run_cmd,
 };
 use crate::state::{State, save_state};
 
@@ -19,6 +19,16 @@ struct GhPrMergeable {
     mergeable: Option<String>,
     #[serde(rename = "mergeStateStatus")]
     merge_state_status: Option<String>,
+}
+
+fn grace_period_elapsed(timestamp: &str, grace_period_secs: u64, now: DateTime<Utc>) -> bool {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
+        return true;
+    };
+    let Ok(grace_period_secs) = i64::try_from(grace_period_secs) else {
+        return false;
+    };
+    now.signed_duration_since(timestamp).num_seconds() >= grace_period_secs
 }
 
 async fn fetch_pr_mergeable(config: &Config, repo: &str, pr_number: u64) -> Result<GhPrMergeable> {
@@ -60,11 +70,26 @@ async fn check_prs_health(
     for pr in &prs {
         let repo = &pr.repo;
         let num = pr.number;
+        let pr_key = format!("{repo}/prs#{num}");
+
+        if state.pr_cursors.get(&pr_key).is_some_and(|cursor| {
+            !grace_period_elapsed(
+                &cursor.last_updated,
+                config.health_check_grace_period_secs,
+                Utc::now(),
+            )
+        }) {
+            info!(
+                "  health: skipping {}; normal PR activity is within grace period",
+                pr_url(repo, num)
+            );
+            continue;
+        }
 
         let reviews = fetch_pr_reviews(config, repo, num)
             .await
             .unwrap_or_default();
-        let comments = fetch_pr_issue_comments(config, repo, num)
+        let comments = fetch_pr_issue_comments(config, repo, num, &pr.url)
             .await
             .unwrap_or_default();
 
@@ -78,7 +103,7 @@ async fn check_prs_health(
                 state
                     .processed_health
                     .insert(key.clone(), Utc::now().to_rfc3339());
-                info!("  health: {repo}#{num} CHANGES_REQUESTED review");
+                info!("  health: {} CHANGES_REQUESTED review", pr_url(repo, num));
 
                 let ctx = json!({
                     "repo": repo,
@@ -114,6 +139,13 @@ async fn check_prs_health(
             .filter(|c| is_authorized(c.author.as_ref(), config))
             .collect();
         if let Some(last_auth_comment) = auth_comments.last() {
+            if !grace_period_elapsed(
+                &last_auth_comment.created_at,
+                config.health_check_grace_period_secs,
+                Utc::now(),
+            ) {
+                continue;
+            }
             let bot_has_replied = comments.iter().any(|c| {
                 c.id > last_auth_comment.id
                     && c.author
@@ -127,7 +159,8 @@ async fn check_prs_health(
                         .processed_health
                         .insert(key.clone(), Utc::now().to_rfc3339());
                     info!(
-                        "  health: {repo}#{num} unresolved comment {}",
+                        "  health: {} unresolved comment {}",
+                        pr_url(repo, num),
                         last_auth_comment.id
                     );
 
@@ -182,7 +215,8 @@ async fn check_prs_health(
                             .processed_health
                             .insert(key.clone(), Utc::now().to_rfc3339());
                         info!(
-                            "  health: {repo}#{num} merge conflict (status={:?})",
+                            "  health: {} merge conflict (status={:?})",
+                            pr_url(repo, num),
                             m.merge_state_status
                         );
 
@@ -222,7 +256,10 @@ async fn check_prs_health(
                     }
                 }
             }
-            Err(e) => warn!("health: mergeable check failed for {repo}#{num}: {e:#}"),
+            Err(e) => warn!(
+                "health: mergeable check failed for {}: {e:#}",
+                pr_url(repo, num)
+            ),
         }
     }
 
@@ -254,6 +291,19 @@ async fn check_stale_assigned_issues(
         if !state.processed_issues.contains_key(&issue_key) {
             continue;
         }
+        if state
+            .processed_issues
+            .get(&issue_key)
+            .is_some_and(|processed_at| {
+                !grace_period_elapsed(
+                    processed_at,
+                    config.health_check_grace_period_secs,
+                    Utc::now(),
+                )
+            })
+        {
+            continue;
+        }
         if state.processed_health.contains_key(&health_key) {
             continue;
         }
@@ -262,8 +312,8 @@ async fn check_stale_assigned_issues(
             .processed_health
             .insert(health_key.clone(), Utc::now().to_rfc3339());
         info!(
-            "  health: {}#{} stale assigned issue",
-            issue.repo, issue.number
+            "  health: {} stale assigned issue",
+            issue_url(&issue.repo, issue.number)
         );
 
         let ctx = json!({
@@ -300,4 +350,42 @@ async fn check_stale_assigned_issues(
 
     save_state(&config.state_file, state).ok();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grace_period_elapsed;
+    use chrono::{DateTime, Utc};
+
+    fn now() -> DateTime<Utc> {
+        "2026-07-22T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn grace_period_is_inclusive() {
+        assert!(grace_period_elapsed(
+            "2026-07-08T12:00:00Z",
+            14 * 24 * 60 * 60,
+            now()
+        ));
+    }
+
+    #[test]
+    fn recent_and_future_timestamps_remain_in_grace_period() {
+        assert!(!grace_period_elapsed(
+            "2026-07-22T11:59:59Z",
+            14 * 24 * 60 * 60,
+            now()
+        ));
+        assert!(!grace_period_elapsed(
+            "2026-07-23T12:00:00Z",
+            14 * 24 * 60 * 60,
+            now()
+        ));
+    }
+
+    #[test]
+    fn malformed_timestamps_do_not_block_health_checks() {
+        assert!(grace_period_elapsed("not-a-timestamp", 60, now()));
+    }
 }

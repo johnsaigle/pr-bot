@@ -36,8 +36,13 @@ async fn main() -> Result<()> {
     });
 
     let config: Config = {
-        let data = std::fs::read_to_string(&config_path)
-            .context(format!("Config not found at {config_path}"))?;
+        let data = std::fs::read_to_string(&config_path).context(format!(
+            "Config not found at {config_path}\n\n\
+             To get started from the pr-bot source directory:\n  \
+             make install\n  \
+             # Then edit the installed config.toml with your details\n\n\
+             Alternatively, set PR_BOT_CONFIG to a custom config file path."
+        ))?;
         toml::from_str(&data).context("Failed to parse config")?
     };
 

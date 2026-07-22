@@ -16,6 +16,14 @@ pub(crate) fn repo_from_url(url: &str) -> String {
     }
 }
 
+pub(crate) fn issue_url(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/issues/{number}")
+}
+
+pub(crate) fn pr_url(repo: &str, number: u64) -> String {
+    format!("https://github.com/{repo}/pull/{number}")
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct GhIssue {
@@ -257,6 +265,7 @@ pub(crate) async fn fetch_pr_issue_comments(
     config: &Config,
     repo: &str,
     pr_number: u64,
+    thread_url: &str,
 ) -> Result<Vec<GhComment>> {
     let endpoint = format!("/repos/{repo}/issues/{pr_number}/comments");
     let args: Vec<String> = vec!["api".into(), endpoint, "--jq".into(), ".".into()];
@@ -269,15 +278,15 @@ pub(crate) async fn fetch_pr_issue_comments(
                 Ok(comments) => Ok(comments),
                 Err(e) => {
                     warn!(
-                        "[{repo}#{pr_number}] deserialize comments failed: {e:#}; raw={:.200}",
-                        stdout
+                        "[{}] deserialize comments failed: {e:#}; raw={:.200}",
+                        thread_url, stdout
                     );
                     Ok(vec![])
                 }
             }
         }
         Err(e) => {
-            warn!("[{repo}#{pr_number}] fetch comments failed: {e:#}");
+            warn!("[{}] fetch comments failed: {e:#}", thread_url);
             Ok(vec![])
         }
     }
@@ -356,7 +365,7 @@ pub(crate) fn contains_mention(body: &str, username: &str) -> bool {
 
 // ─── Reactions ────────────────────────────────────────
 
-pub(crate) async fn add_eyes_reaction(config: &Config, repo: &str, number: u64) {
+pub(crate) async fn add_eyes_reaction(config: &Config, repo: &str, number: u64, thread_url: &str) {
     let endpoint = format!("/repos/{repo}/issues/{number}/reactions");
     let args: Vec<String> = vec![
         "api".into(),
@@ -368,7 +377,24 @@ pub(crate) async fn add_eyes_reaction(config: &Config, repo: &str, number: u64) 
         "--silent".into(),
     ];
     match run_cmd(&config.gh_bin, &args).await {
-        Ok(_) => info!("  👀 {repo}#{number}"),
-        Err(e) => debug!("failed to add 👀 reaction to {repo}#{number}: {e:#}"),
+        Ok(_) => info!("  👀 {thread_url}"),
+        Err(e) => debug!("failed to add 👀 reaction to {thread_url}: {e:#}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{issue_url, pr_url};
+
+    #[test]
+    fn formats_github_urls() {
+        assert_eq!(
+            issue_url("owner/repo", 12),
+            "https://github.com/owner/repo/issues/12"
+        );
+        assert_eq!(
+            pr_url("owner/repo", 34),
+            "https://github.com/owner/repo/pull/34"
+        );
     }
 }

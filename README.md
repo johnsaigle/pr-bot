@@ -52,6 +52,7 @@ authorized_user = "your-real-username"
 # workflows_dir = "~/.config/pr-bot/workflows"
 # cache_dir = "~/.cache/pr-bot"
 # poll_interval_secs = 300
+# health_check_grace_period_secs = 1209600 # 14 days
 # task_timeout_secs = 1800
 # max_concurrent = 3
 # model = "anthropic/claude-sonnet-4"
@@ -62,6 +63,7 @@ authorized_user = "your-real-username"
 - `authorized_user` — the human whose commands the bot will listen to (gates everything)
 - `workflows_dir` — where workflow `.md` files live
 - `poll_mentions` — enable @mention scanning via GitHub search + comment-thread scanning
+- `health_check_grace_period_secs` — minimum age before health checks follow up on recent work
 
 ### Workflow files
 
