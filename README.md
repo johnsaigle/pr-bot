@@ -85,7 +85,14 @@ Or set `PR_BOT_CONFIG` in your environment and run the binary directly.
 
 ```
 pr-bot/
-├── src/main.rs          # Polling loop, GitHub API, opencode launcher
+├── src/
+│   ├── main.rs          # CLI setup and application entry point
+│   ├── app.rs           # Polling loop and event dispatch
+│   ├── config.rs        # Configuration and defaults
+│   ├── state.rs         # Persisted processing state
+│   ├── github.rs        # GitHub API commands and response types
+│   ├── agent.rs         # Task directories and opencode launcher
+│   └── health.rs        # PR and issue health checks
 ├── Cargo.toml           # Rust dependencies
 ├── config.example.toml  # Example configuration
 ├── workflows/           # Workflows the agent follows
