@@ -20,7 +20,7 @@ If you exit without pushing a commit, replying, or opening a PR, the task has fa
 
 ## Environment
 
-You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
+You are running in a unique, empty task directory. Keep all clones, build artifacts, and temporary files inside this directory. Do not read or write paths outside it.
 
 ### Fork setup (required)
 
@@ -29,23 +29,15 @@ The bot account typically does NOT have push access to `{repo}`. You must work v
 1. Ensure a fork exists under the bot account: `gh repo fork {repo} --clone=false` (idempotent — safe to run if the fork already exists).
 2. The fork's full name is `{bot_username}/<repo-name>` (the repo name portion of `{repo}`).
 
-### Worktree isolation (required)
+### Task isolation (required)
 
-You must use git worktrees to isolate each task. Never work directly in the main clone.
-
-1. Clone the **upstream** repo as a bare base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. For PR-related health items: fetch the PR branch from the fork and create a worktree at `~/.cache/pr-bot/worktrees/{repo}-health-pr-{pr_number}`.
-3. For issue-related health items: determine the default branch and create a worktree at `~/.cache/pr-bot/worktrees/{repo}-health-issue-{number}`.
-4. Inside the worktree, add the fork as a remote: `git remote add fork https://github.com/{bot_username}/<repo-name>.git`
-5. When you're done, clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
-
-Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
+When repository changes are required, clone the upstream repository into `./repo` and add the bot fork as the `fork` remote. For PR-related health items, obtain the head branch with `gh pr view {pr_number} --repo {repo} --json headRefName --jq '.headRefName'`, fetch it from the fork, and check it out. The task directory itself provides isolation; do not use shared clones, caches, or git worktrees from another path.
 
 ## Workflow
 
 1. Read the task context provided in the prompt (JSON with `repo`, `type`, `pr_number` or `issue_number`, `title`, `details`, `bot_username`).
 2. Understand what type of health issue you're dealing with (see `type` field).
-3. Set up the worktree as described above.
+3. If code changes are needed, clone the repository as described above.
 
 ### By health issue type
 
@@ -53,7 +45,7 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 
 The authorized user left a review that blocks merge. Your PR hasn't been updated since the review.
 
-1. Fetch the PR branch from the fork into the worktree.
+1. Fetch the PR branch from the fork into the task-local clone.
 2. Read all review comments and review body from the blocking review.
 3. Make the requested changes.
 4. Run any existing tests to verify your changes.
@@ -64,7 +56,7 @@ The authorized user left a review that blocks merge. Your PR hasn't been updated
 
 The authorized user left a comment on your PR that you haven't replied to. The thread is stalled.
 
-1. Fetch the PR branch from the fork into the worktree.
+1. Fetch the PR branch from the fork into the task-local clone.
 2. Read the unresolved comment. Determine if it:
    - Requests a code change → make the change, commit, push.
    - Asks a question → reply on the PR answering the question.
@@ -75,7 +67,7 @@ The authorized user left a comment on your PR that you haven't replied to. The t
 
 Your PR has merge conflicts against the base branch and can't be merged.
 
-1. Fetch the PR branch from the fork into the worktree.
+1. Fetch the PR branch from the fork into the task-local clone.
 2. Find the default branch: `gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`
 3. Fetch and rebase: `git fetch origin <default-branch> && git rebase origin/<default-branch>`
 4. If the rebase has conflicts, resolve them carefully without changing unrelated code. Prefer your PR's intent over upstream changes where they conflict on the same intent; prefer upstream changes for unrelated modifications.
@@ -99,3 +91,4 @@ An issue is assigned to you, was previously processed (a task was launched), but
 - Do NOT change the project's build system, lint config, or CI unless the health issue explicitly requires it.
 - If you can't resolve the health issue without more context, post a comment on the GitHub thread asking for clarification. You are non-interactive — never block waiting for an answer.
 - Health checks are recurring — the same item may be re-detected if not resolved. Avoid making the same failing action repeatedly. If you tried and failed before, explain the blocker in a comment.
+- Do not access files outside the current task directory.

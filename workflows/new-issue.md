@@ -22,7 +22,7 @@ If you exit without either a PR or a comment, the task has failed — the human 
 
 ## Environment
 
-You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
+You are running in a unique, empty task directory. Keep all clones, build artifacts, and temporary files inside this directory. Do not read or write paths outside it.
 
 ### Fork setup (required)
 
@@ -31,24 +31,14 @@ The bot account typically does NOT have push access to `{repo}`. You must work v
 1. Ensure a fork exists under the bot account: `gh repo fork {repo} --clone=false` (idempotent — safe to run if the fork already exists).
 2. The fork's full name is `{bot_username}/<repo-name>` (the repo name portion of `{repo}`).
 
-### Worktree isolation (required)
+### Task isolation (required)
 
-You must use git worktrees to isolate each task. Never work directly in the main clone.
-
-1. Clone the **upstream** repo as a bare base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. Determine the repo's default branch: `gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name'`
-3. Fetch the latest from origin: `git -C <base> fetch origin`
-4. Create a worktree for this task: `git -C <base> worktree add --detach <worktree-path> origin/<default-branch>`
-5. Inside the worktree, add the fork as a remote: `git remote add fork https://github.com/{bot_username}/<repo-name>.git`
-6. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-issue-{number}`.
-7. When you're done (PR opened and pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
-
-Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
+Clone the upstream repository into `./repo`, add the bot fork as the `fork` remote, and do all work there. The task directory itself provides isolation; do not use shared clones, caches, or git worktrees from another path.
 
 ## Workflow
 
 1. Read the task context provided in the prompt (JSON with `repo`, `issue_number`, `title`, `body`, `bot_username`).
-2. Set up the fork and worktree as described above.
+2. Set up the fork and clone the upstream repository into `./repo` as described above.
 3. **Assign yourself to the issue** so others know you are working on it:
    ```
    gh issue edit {number} --repo {repo} --add-assignee @{bot_username}
@@ -70,12 +60,12 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
     ```
     gh issue edit {number} --repo {repo} --remove-assignee @{bot_username}
     ```
-12. Clean up the worktree.
-13. If you encounter ambiguity and can't proceed, post a comment on the issue explaining what you need clarified, then **unassign yourself**.
+12. If you encounter ambiguity and can't proceed, post a comment on the issue explaining what you need clarified, then **unassign yourself**.
 
 ## Constraints
 
 - Do NOT modify files outside the scope of the issue unless strictly necessary to make the change work.
 - Do NOT change the project's build system, lint config, or CI unless the issue explicitly requires it.
 - Prefer small, focused changes over large refactors.
+- Do not access files outside the current task directory.
 - **Attribution signature**: Unless `attribution.enabled` is `false` in the task context, append the `attribution.signature` value from the task context to every comment you post (after the main content, separated by a blank line) and every commit message.

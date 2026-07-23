@@ -26,6 +26,17 @@ Polling cursors and completed tasks are tracked in a JSON state file to prevent 
 - [opencode](https://github.com/anomalyco/opencode)
 - [`gh` CLI](https://cli.github.com/) authenticated with a GitHub token that has repo/issue/PR scope
 
+### Security model
+
+`pr-bot` launches an autonomous coding agent that can run repository code and use GitHub credentials. It is intended to run under both:
+
+- A dedicated GitHub bot account with only the repository, issue, and pull request access needed by its workflows.
+- A dedicated OS account whose home directory contains no personal credentials, unrelated repositories, or other sensitive data.
+
+Do not run the bot as your normal user or authenticate it with your personal GitHub account. Treat repository content, issue text, comments, build scripts, tests, and dependency metadata as untrusted input. The account boundaries limit the impact of a compromised or misdirected agent; they do not make that input trusted.
+
+The agent process receives a sanitized environment. Authenticate `gh` and OpenCode from the dedicated OS account with `gh auth login` and `opencode auth login` rather than relying on inherited token environment variables.
+
 ### Install
 
 ```bash

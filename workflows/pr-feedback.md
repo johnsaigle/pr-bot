@@ -23,29 +23,20 @@ gh pr edit {number} --repo {repo} --remove-assignee @{bot_username}
 
 ## Environment
 
-You are running in an empty working directory. No repo is cloned yet — you own the git setup from scratch.
+You are running in a unique, empty task directory. Keep all clones, build artifacts, and temporary files inside this directory. Do not read or write paths outside it.
 
 ### Fork setup (required)
 
 The bot account typically does NOT have push access to `{repo}`. PR branches live on the bot's fork (`{bot_username}/<repo-name>`), not on the upstream.
 
-### Worktree isolation (required)
+### Task isolation (required)
 
-You must use git worktrees to isolate each PR. Never work directly in the main clone.
-
-1. Clone the **upstream** repo as a bare base if one doesn't already exist at `~/.cache/pr-bot/repos/{owner}/{repo}/`.
-2. Fetch the PR branch from the **fork**: `git -C <base> fetch https://github.com/{bot_username}/<repo-name>.git pull/{pr_number}/head:refs/heads/pr-{pr_number}`
-3. Create a worktree for this PR: `git -C <base> worktree add --detach <worktree-path> pr-{pr_number}` (using the fetched ref)
-4. Inside the worktree, add the fork as a remote: `git remote add fork https://github.com/{bot_username}/<repo-name>.git`
-5. Do all your work inside the worktree. The worktree path should be `~/.cache/pr-bot/worktrees/{repo}-pr-{number}`.
-6. When you're done (changes pushed), clean up the worktree: `git -C <base> worktree remove <worktree-path>` and `git -C <base> worktree prune`.
-
-Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch worktrees you didn't create.
+Clone the upstream repository into `./repo`, add the bot fork as the `fork` remote, fetch the PR's head branch from that remote, and check it out locally. Use `gh pr view {pr_number} --repo {repo} --json headRefName --jq '.headRefName'` to obtain the branch name. The task directory itself provides isolation; do not use shared clones, caches, or git worktrees from another path.
 
 ## Workflow
 
 1. Read the task context provided in the prompt (JSON with `repo`, `pr_number`, `title`, `bot_username`, `comments`, `review_comments`, `reviews`).
-2. Set up the worktree for this PR as described above.
+2. Clone and check out the PR branch as described above.
 3. **Assign yourself to the PR** so the reviewer knows you are addressing feedback:
    ```
    gh pr edit {pr_number} --repo {repo} --add-assignee @{bot_username}
@@ -65,7 +56,6 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
     ```
     gh pr edit {pr_number} --repo {repo} --remove-assignee @{bot_username}
     ```
-13. Clean up the worktree.
 
 ## Constraints
 
@@ -73,4 +63,5 @@ Never run `git worktree` with paths outside `~/.cache/pr-bot/`. Do not touch wor
 - Do NOT modify files that aren't related to the feedback.
 - Do NOT change the PR title or description unless a comment explicitly asks for it.
 - If you can't resolve a comment without more context, ask rather than guessing.
+- Do not access files outside the current task directory.
 - **Attribution signature**: Unless `attribution.enabled` is `false` in the task context, append the `attribution.signature` value from the task context to every comment you post (after the main content, separated by a blank line) and every commit message.

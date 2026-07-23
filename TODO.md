@@ -2,7 +2,7 @@
 
 ## P0: Security
 
-- [ ] Replace `--dangerously-skip-permissions` with task-specific capabilities for read-only analysis, comments, PR updates, and pushes.
+- [ ] Refine the baseline OpenCode deny policy into workflow-specific capabilities for read-only analysis, comments, PR updates, and pushes.
 - [ ] Isolate agent credentials using a sanitized environment and short-lived, repository-scoped GitHub tokens or an audited credential broker.
 - [ ] Add prompt-injection and credential-exfiltration evals using malicious issues, comments, repository files, logs, and dependency metadata.
 
@@ -32,5 +32,5 @@
 
 ## P3: Workflows
 
-- [ ] Evaluate leaner, model-specific workflows while retaining hard safety invariants such as fork-only pushes and worktree boundaries.
+- [ ] Evaluate leaner, model-specific workflows while retaining hard safety invariants such as fork-only pushes and task-directory boundaries.
 - [ ] Use completion rate, artifact quality, policy violations, and regression evals to assess workflow changes.
